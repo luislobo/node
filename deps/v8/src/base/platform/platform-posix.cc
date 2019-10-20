@@ -624,7 +624,9 @@ void OS::Abort() {
 
 void OS::DebugBreak() {
 #if V8_HOST_ARCH_ARM
-  asm("bkpt 0");
+  asm(".arch armv5t\n"
+      ".object_arch armv4t\n"
+      "bkpt #0");
 #elif V8_HOST_ARCH_ARM64
   asm("brk 0");
 #elif V8_HOST_ARCH_MIPS
