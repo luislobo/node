@@ -47,6 +47,16 @@
 #include <dlfcn.h>
 #endif
 
+#if defined(_WIN32)
+#include <io.h>  // _S_IREAD _S_IWRITE
+#ifndef S_IRUSR
+#define S_IRUSR _S_IREAD
+#endif  // S_IRUSR
+#ifndef S_IWUSR
+#define S_IWUSR _S_IWRITE
+#endif  // S_IWUSR
+#endif
+
 #include <cerrno>
 #include <csignal>
 #include <limits>
@@ -806,6 +816,10 @@ void DefineCryptoConstants(Local<Object> target) {
     NODE_DEFINE_CONSTANT(target, SSL_OP_ALL);
 #endif
 
+#ifdef SSL_OP_ALLOW_NO_DHE_KEX
+    NODE_DEFINE_CONSTANT(target, SSL_OP_ALLOW_NO_DHE_KEX);
+#endif
+
 #ifdef SSL_OP_ALLOW_UNSAFE_LEGACY_RENEGOTIATION
     NODE_DEFINE_CONSTANT(target, SSL_OP_ALLOW_UNSAFE_LEGACY_RENEGOTIATION);
 #endif
@@ -870,8 +884,16 @@ void DefineCryptoConstants(Local<Object> target) {
     NODE_DEFINE_CONSTANT(target, SSL_OP_NO_COMPRESSION);
 #endif
 
+#ifdef SSL_OP_NO_ENCRYPT_THEN_MAC
+    NODE_DEFINE_CONSTANT(target, SSL_OP_NO_ENCRYPT_THEN_MAC);
+#endif
+
 #ifdef SSL_OP_NO_QUERY_MTU
     NODE_DEFINE_CONSTANT(target, SSL_OP_NO_QUERY_MTU);
+#endif
+
+#ifdef SSL_OP_NO_RENEGOTIATION
+    NODE_DEFINE_CONSTANT(target, SSL_OP_NO_RENEGOTIATION);
 #endif
 
 #ifdef SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION
@@ -902,12 +924,20 @@ void DefineCryptoConstants(Local<Object> target) {
     NODE_DEFINE_CONSTANT(target, SSL_OP_NO_TLSv1_2);
 #endif
 
+#ifdef SSL_OP_NO_TLSv1_3
+    NODE_DEFINE_CONSTANT(target, SSL_OP_NO_TLSv1_3);
+#endif
+
 #ifdef SSL_OP_PKCS1_CHECK_1
     NODE_DEFINE_CONSTANT(target, SSL_OP_PKCS1_CHECK_1);
 #endif
 
 #ifdef SSL_OP_PKCS1_CHECK_2
     NODE_DEFINE_CONSTANT(target, SSL_OP_PKCS1_CHECK_2);
+#endif
+
+#ifdef SSL_OP_PRIORITIZE_CHACHA
+    NODE_DEFINE_CONSTANT(target, SSL_OP_PRIORITIZE_CHACHA);
 #endif
 
 #ifdef SSL_OP_SINGLE_DH_USE
@@ -1072,12 +1102,6 @@ void DefineCryptoConstants(Local<Object> target) {
   NODE_DEFINE_CONSTANT(target, POINT_CONVERSION_UNCOMPRESSED);
 
   NODE_DEFINE_CONSTANT(target, POINT_CONVERSION_HYBRID);
-
-  NODE_DEFINE_STRING_CONSTANT(
-      target,
-      "defaultCipherList",
-      per_process::cli_options->tls_cipher_list.c_str());
-
 #endif
 }
 

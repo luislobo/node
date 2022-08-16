@@ -2,25 +2,9 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-// Flags: --allow-natives-syntax --harmony-dynamic-import
+// Flags: --allow-natives-syntax
 
 var ran = false;
-
-async function test1() {
-  try {
-    let x = await import('modules-skip-8.mjs');
-    %AbortJS('failure: should be unreachable');
-  } catch(e) {
-    assertEquals('Unexpected reserved word', e.message);
-    ran = true;
-  }
-}
-
-test1();
-%PerformMicrotaskCheckpoint();
-assertTrue(ran);
-
-ran = false;
 
 async function test2() {
   try {
@@ -47,7 +31,7 @@ async function test3() {
     let x = await import('nonexistent-file.mjs');
     %AbortJS('failure: should be unreachable');
   } catch(e) {
-    assertTrue(e.startsWith('Error reading'));
+    assertTrue(e.message.startsWith('d8: Error reading'));
     ran = true;
   }
 }

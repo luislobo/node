@@ -103,8 +103,9 @@ const invalidThenableFunc = () => {
   promises.push(assert.rejects(promise, {
     name: 'TypeError',
     code: 'ERR_INVALID_RETURN_VALUE',
+    // FIXME(JakobJingleheimer): This should match on key words, like /Promise/ and /undefined/.
     message: 'Expected instance of Promise to be returned ' +
-             'from the "promiseFn" function but got type undefined.'
+             'from the "promiseFn" function but got undefined.'
   }));
 
   promise = assert.rejects(Promise.resolve(), common.mustNotCall());
@@ -125,8 +126,8 @@ promises.push(assert.rejects(
   assert.rejects('fail', {}),
   {
     code: 'ERR_INVALID_ARG_TYPE',
-    message: 'The "promiseFn" argument must be one of type ' +
-             'Function or Promise. Received type string'
+    message: 'The "promiseFn" argument must be of type function or an ' +
+             "instance of Promise. Received type string ('fail')"
   }
 ));
 
@@ -136,7 +137,7 @@ promises.push(assert.rejects(
     assert.strictEqual(err.code, 'ERR_ASSERTION');
     assert.strictEqual(err.actual, actual);
     assert.strictEqual(err.operator, 'rejects');
-    assert(/rejects/.test(err.stack));
+    assert.match(err.stack, /rejects/);
     return true;
   };
   const err = new Error();
@@ -162,7 +163,7 @@ promises.push(assert.rejects(
   let promise = assert.doesNotReject(() => new Map(), common.mustNotCall());
   promises.push(assert.rejects(promise, {
     message: 'Expected instance of Promise to be returned ' +
-             'from the "promiseFn" function but got instance of Map.',
+             'from the "promiseFn" function but got an instance of Map.',
     code: 'ERR_INVALID_RETURN_VALUE',
     name: 'TypeError'
   }));
@@ -225,8 +226,8 @@ promises.push(assert.rejects(
     assert.doesNotReject(123),
     {
       code: 'ERR_INVALID_ARG_TYPE',
-      message: 'The "promiseFn" argument must be one of type ' +
-               'Function or Promise. Received type number'
+      message: 'The "promiseFn" argument must be of type ' +
+               'function or an instance of Promise. Received type number (123)'
     }
   ));
   /* eslint-enable no-restricted-syntax */

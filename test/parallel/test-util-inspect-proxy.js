@@ -41,11 +41,42 @@ proxyObj = new Proxy(target, handler);
 // Inspecting the proxy should not actually walk it's properties
 util.inspect(proxyObj, opts);
 
+// Make sure inspecting object does not trigger any proxy traps.
+util.format('%s', proxyObj);
+
 // getProxyDetails is an internal method, not intended for public use.
 // This is here to test that the internals are working correctly.
-const details = processUtil.getProxyDetails(proxyObj);
+let details = processUtil.getProxyDetails(proxyObj, true);
 assert.strictEqual(target, details[0]);
 assert.strictEqual(handler, details[1]);
+
+details = processUtil.getProxyDetails(proxyObj);
+assert.strictEqual(target, details[0]);
+assert.strictEqual(handler, details[1]);
+
+details = processUtil.getProxyDetails(proxyObj, false);
+assert.strictEqual(target, details);
+
+details = processUtil.getProxyDetails({}, true);
+assert.strictEqual(details, undefined);
+
+const r = Proxy.revocable({}, {});
+r.revoke();
+
+details = processUtil.getProxyDetails(r.proxy, true);
+assert.strictEqual(details[0], null);
+assert.strictEqual(details[1], null);
+
+details = processUtil.getProxyDetails(r.proxy, false);
+assert.strictEqual(details, null);
+
+assert.strictEqual(util.inspect(r.proxy), '<Revoked Proxy>');
+assert.strictEqual(
+  util.inspect(r, { showProxy: true }),
+  '{ proxy: <Revoked Proxy>, revoke: [Function (anonymous)] }',
+);
+
+assert.strictEqual(util.format('%s', r.proxy), '<Revoked Proxy>');
 
 assert.strictEqual(
   util.inspect(proxyObj, opts),
@@ -105,7 +136,7 @@ const expected6 = 'Proxy [\n' +
                   '  ]\n' +
                   ']';
 assert.strictEqual(
-  util.inspect(proxy1, { showProxy: true, depth: null }),
+  util.inspect(proxy1, { showProxy: 1, depth: null }),
   expected1);
 assert.strictEqual(util.inspect(proxy2, opts), expected2);
 assert.strictEqual(util.inspect(proxy3, opts), expected3);

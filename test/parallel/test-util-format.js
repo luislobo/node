@@ -57,6 +57,8 @@ assert.strictEqual(util.format('%d', -0.0), '-0');
 assert.strictEqual(util.format('%d', ''), '0');
 assert.strictEqual(util.format('%d', ' -0.000'), '-0');
 assert.strictEqual(util.format('%d', Symbol()), 'NaN');
+assert.strictEqual(util.format('%d', Infinity), 'Infinity');
+assert.strictEqual(util.format('%d', -Infinity), '-Infinity');
 assert.strictEqual(util.format('%d %d', 42, 43), '42 43');
 assert.strictEqual(util.format('%d %d', 42), '42 %d');
 assert.strictEqual(
@@ -72,6 +74,38 @@ assert.strictEqual(
   '1180591620717411303424n 12345678901234567890123n'
 );
 
+{
+  const { numericSeparator } = util.inspect.defaultOptions;
+  util.inspect.defaultOptions.numericSeparator = true;
+
+  assert.strictEqual(
+    util.format('%d', 1180591620717411303424),
+    '1.1805916207174113e+21'
+  );
+
+  assert.strictEqual(
+    util.format(
+      // eslint-disable-next-line no-loss-of-precision
+      '%d %s %i', 118059162071741130342, 118059162071741130342, 123_123_123),
+    '118_059_162_071_741_140_000 118_059_162_071_741_140_000 123_123_123'
+  );
+
+  assert.strictEqual(
+    util.format(
+      '%d %s',
+      1_180_591_620_717_411_303_424n,
+      12_345_678_901_234_567_890_123n
+    ),
+    '1_180_591_620_717_411_303_424n 12_345_678_901_234_567_890_123n'
+  );
+
+  assert.strictEqual(
+    util.format('%i', 1_180_591_620_717_411_303_424n),
+    '1_180_591_620_717_411_303_424n'
+  );
+
+  util.inspect.defaultOptions.numericSeparator = numericSeparator;
+}
 // Integer format specifier
 assert.strictEqual(util.format('%i'), '%i');
 assert.strictEqual(util.format('%i', 42.0), '42');
@@ -81,6 +115,8 @@ assert.strictEqual(util.format('%i', '42.0'), '42');
 assert.strictEqual(util.format('%i', 1.5), '1');
 assert.strictEqual(util.format('%i', -0.5), '-0');
 assert.strictEqual(util.format('%i', ''), 'NaN');
+assert.strictEqual(util.format('%i', Infinity), 'NaN');
+assert.strictEqual(util.format('%i', -Infinity), 'NaN');
 assert.strictEqual(util.format('%i', Symbol()), 'NaN');
 assert.strictEqual(util.format('%i %i', 42, 43), '42 43');
 assert.strictEqual(util.format('%i %i', 42), '42 %i');
@@ -107,6 +143,13 @@ assert.strictEqual(
   '1180591620717411303424n 12345678901234567890123n'
 );
 
+assert.strictEqual(
+  util.formatWithOptions(
+    { numericSeparator: true },
+    '%i %d', 1180591620717411303424n, 12345678901234567890123n),
+  '1_180_591_620_717_411_303_424n 12_345_678_901_234_567_890_123n'
+);
+
 // Float format specifier
 assert.strictEqual(util.format('%f'), '%f');
 assert.strictEqual(util.format('%f', 42.0), '42');
@@ -120,6 +163,8 @@ assert.strictEqual(util.format('%f', Math.PI), '3.141592653589793');
 assert.strictEqual(util.format('%f', ''), 'NaN');
 assert.strictEqual(util.format('%f', Symbol('foo')), 'NaN');
 assert.strictEqual(util.format('%f', 5n), '5');
+assert.strictEqual(util.format('%f', Infinity), 'Infinity');
+assert.strictEqual(util.format('%f', -Infinity), '-Infinity');
 assert.strictEqual(util.format('%f %f', 42, 43), '42 43');
 assert.strictEqual(util.format('%f %f', 42), '42 %f');
 
@@ -141,6 +186,8 @@ assert.strictEqual(util.format('%s', { a: [1, 2, 3] }), '{ a: [Array] }');
 assert.strictEqual(util.format('%s', { toString() { return 'Foo'; } }), 'Foo');
 assert.strictEqual(util.format('%s', { toString: 5 }), '{ toString: 5 }');
 assert.strictEqual(util.format('%s', () => 5), '() => 5');
+assert.strictEqual(util.format('%s', Infinity), 'Infinity');
+assert.strictEqual(util.format('%s', -Infinity), '-Infinity');
 
 // String format specifier including `toString` properties on the prototype.
 {
@@ -158,7 +205,67 @@ assert.strictEqual(util.format('%s', () => 5), '() => 5');
   class Foobar extends Array { aaa = true; }
   assert.strictEqual(
     util.format('%s', new Foobar(5)),
-    'Foobar [ <5 empty items>, aaa: true ]'
+    'Foobar(5) [ <5 empty items>, aaa: true ]'
+  );
+
+  // Subclassing:
+  class B extends Foo {}
+
+  function C() {}
+  C.prototype.toString = function() {
+    return 'Custom';
+  };
+
+  function D() {
+    C.call(this);
+  }
+  D.prototype = Object.create(C.prototype);
+
+  assert.strictEqual(
+    util.format('%s', new B()),
+    'Bar'
+  );
+  assert.strictEqual(
+    util.format('%s', new C()),
+    'Custom'
+  );
+  assert.strictEqual(
+    util.format('%s', new D()),
+    'Custom'
+  );
+
+  D.prototype.constructor = D;
+  assert.strictEqual(
+    util.format('%s', new D()),
+    'Custom'
+  );
+
+  D.prototype.constructor = null;
+  assert.strictEqual(
+    util.format('%s', new D()),
+    'Custom'
+  );
+
+  D.prototype.constructor = { name: 'Foobar' };
+  assert.strictEqual(
+    util.format('%s', new D()),
+    'Custom'
+  );
+
+  Object.defineProperty(D.prototype, 'constructor', {
+    get() {
+      throw new Error();
+    },
+    configurable: true
+  });
+  assert.strictEqual(
+    util.format('%s', new D()),
+    'Custom'
+  );
+
+  assert.strictEqual(
+    util.format('%s', Object.create(null)),
+    '[Object: null prototype] {}'
   );
 }
 
@@ -198,7 +305,7 @@ assert.strictEqual(
   '  func: <ref *1> [Function: func] {\n' +
   '    [length]: 0,\n' +
   '    [name]: \'func\',\n' +
-  '    [prototype]: func { [constructor]: [Circular *1] }\n' +
+  '    [prototype]: { [constructor]: [Circular *1] }\n' +
   '  }\n' +
   '}');
 assert.strictEqual(
@@ -211,7 +318,7 @@ assert.strictEqual(
   '      a: <ref *1> [Function: a] {\n' +
   '        [length]: 0,\n' +
   '        [name]: \'a\',\n' +
-  '        [prototype]: a { [constructor]: [Circular *1] }\n' +
+  '        [prototype]: { [constructor]: [Circular *1] }\n' +
   '      }\n' +
   '    },\n' +
   '    [length]: 1\n' +
@@ -226,7 +333,7 @@ assert.strictEqual(
   '    func: <ref *1> [Function: func] {\n' +
   '      [length]: 0,\n' +
   '      [name]: \'func\',\n' +
-  '      [prototype]: func { [constructor]: [Circular *1] }\n' +
+  '      [prototype]: { [constructor]: [Circular *1] }\n' +
   '    }\n' +
   '  }\n' +
   '}');
@@ -238,7 +345,7 @@ assert.strictEqual(
   '  func: <ref *1> [Function: func] {\n' +
   '    [length]: 0,\n' +
   '    [name]: \'func\',\n' +
-  '    [prototype]: func { [constructor]: [Circular *1] }\n' +
+  '    [prototype]: { [constructor]: [Circular *1] }\n' +
   '  }\n' +
   '} {\n' +
   '  foo: \'bar\',\n' +
@@ -246,7 +353,7 @@ assert.strictEqual(
   '  func: <ref *1> [Function: func] {\n' +
   '    [length]: 0,\n' +
   '    [name]: \'func\',\n' +
-  '    [prototype]: func { [constructor]: [Circular *1] }\n' +
+  '    [prototype]: { [constructor]: [Circular *1] }\n' +
   '  }\n' +
   '}');
 assert.strictEqual(
@@ -257,7 +364,7 @@ assert.strictEqual(
   '  func: <ref *1> [Function: func] {\n' +
   '    [length]: 0,\n' +
   '    [name]: \'func\',\n' +
-  '    [prototype]: func { [constructor]: [Circular *1] }\n' +
+  '    [prototype]: { [constructor]: [Circular *1] }\n' +
   '  }\n' +
   '} %o');
 
@@ -416,7 +523,7 @@ assert.strictEqual(
   5n,
   5,
   'test',
-  Symbol()
+  Symbol(),
 ].forEach((invalidOptions) => {
   assert.throws(() => {
     util.formatWithOptions(invalidOptions, { a: true });

@@ -22,8 +22,8 @@
 #include "handle_wrap.h"
 #include "async_wrap-inl.h"
 #include "env-inl.h"
+#include "node_external_reference.h"
 #include "util-inl.h"
-#include "node.h"
 
 namespace node {
 
@@ -31,6 +31,7 @@ using v8::Context;
 using v8::FunctionCallbackInfo;
 using v8::FunctionTemplate;
 using v8::HandleScope;
+using v8::Isolate;
 using v8::Local;
 using v8::Object;
 using v8::Value;
@@ -84,14 +85,24 @@ void HandleWrap::Close(Local<Value> close_callback) {
 }
 
 
-void HandleWrap::MakeWeak() {
-  persistent().SetWeak(
-      this,
-      [](const v8::WeakCallbackInfo<HandleWrap>& data) {
-        HandleWrap* handle_wrap = data.GetParameter();
-        handle_wrap->persistent().Reset();
-        handle_wrap->Close();
-      }, v8::WeakCallbackType::kParameter);
+void HandleWrap::OnGCCollect() {
+  // When all references to a HandleWrap are lost and the object is supposed to
+  // be destroyed, we first call Close() to clean up the underlying libuv
+  // handle. The OnClose callback then acquires and destroys another reference
+  // to that object, and when that reference is lost, we perform the default
+  // action (i.e. destroying `this`).
+  if (state_ != kClosed) {
+    Close();
+  } else {
+    BaseObject::OnGCCollect();
+  }
+}
+
+
+bool HandleWrap::IsNotIndicativeOfMemoryLeakAtExit() const {
+  return IsWeakOrDetached() ||
+         !HandleWrap::HasRef(this) ||
+         !uv_is_active(GetHandle());
 }
 
 
@@ -116,12 +127,16 @@ HandleWrap::HandleWrap(Environment* env,
       handle_(handle) {
   handle_->data = this;
   HandleScope scope(env->isolate());
+  CHECK(env->has_run_bootstrapping_code());
   env->handle_wrap_queue()->PushBack(this);
 }
 
 
 void HandleWrap::OnClose(uv_handle_t* handle) {
-  std::unique_ptr<HandleWrap> wrap { static_cast<HandleWrap*>(handle->data) };
+  CHECK_NOT_NULL(handle->data);
+  BaseObjectPtr<HandleWrap> wrap { static_cast<HandleWrap*>(handle->data) };
+  wrap->Detach();
+
   Environment* env = wrap->env();
   HandleScope scope(env->isolate());
   Context::Scope context_scope(env->context());
@@ -131,6 +146,7 @@ void HandleWrap::OnClose(uv_handle_t* handle) {
   wrap->state_ = kClosed;
 
   wrap->OnClose();
+  wrap->handle_wrap_queue_.Remove();
 
   if (!wrap->persistent().IsEmpty() &&
       wrap->object()->Has(env->context(), env->handle_onclose_symbol())
@@ -142,17 +158,28 @@ void HandleWrap::OnClose(uv_handle_t* handle) {
 Local<FunctionTemplate> HandleWrap::GetConstructorTemplate(Environment* env) {
   Local<FunctionTemplate> tmpl = env->handle_wrap_ctor_template();
   if (tmpl.IsEmpty()) {
-    tmpl = env->NewFunctionTemplate(nullptr);
+    Isolate* isolate = env->isolate();
+    tmpl = NewFunctionTemplate(isolate, nullptr);
     tmpl->SetClassName(FIXED_ONE_BYTE_STRING(env->isolate(), "HandleWrap"));
     tmpl->Inherit(AsyncWrap::GetConstructorTemplate(env));
-    env->SetProtoMethod(tmpl, "close", HandleWrap::Close);
-    env->SetProtoMethodNoSideEffect(tmpl, "hasRef", HandleWrap::HasRef);
-    env->SetProtoMethod(tmpl, "ref", HandleWrap::Ref);
-    env->SetProtoMethod(tmpl, "unref", HandleWrap::Unref);
+    SetProtoMethod(isolate, tmpl, "close", HandleWrap::Close);
+    SetProtoMethodNoSideEffect(isolate, tmpl, "hasRef", HandleWrap::HasRef);
+    SetProtoMethod(isolate, tmpl, "ref", HandleWrap::Ref);
+    SetProtoMethod(isolate, tmpl, "unref", HandleWrap::Unref);
     env->set_handle_wrap_ctor_template(tmpl);
   }
   return tmpl;
 }
 
+void HandleWrap::RegisterExternalReferences(
+    ExternalReferenceRegistry* registry) {
+  registry->Register(HandleWrap::Close);
+  registry->Register(HandleWrap::HasRef);
+  registry->Register(HandleWrap::Ref);
+  registry->Register(HandleWrap::Unref);
+}
 
 }  // namespace node
+
+NODE_MODULE_EXTERNAL_REFERENCE(handle_wrap,
+                               node::HandleWrap::RegisterExternalReferences)

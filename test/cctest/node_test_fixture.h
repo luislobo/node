@@ -60,56 +60,71 @@ using ArrayBufferUniquePtr = std::unique_ptr<node::ArrayBufferAllocator,
 using TracingAgentUniquePtr = std::unique_ptr<node::tracing::Agent>;
 using NodePlatformUniquePtr = std::unique_ptr<node::NodePlatform>;
 
-class NodeTestFixture : public ::testing::Test {
+class NodeTestEnvironment final : public ::testing::Environment {
+ public:
+  NodeTestEnvironment()  = default;
+  void SetUp() override;
+  void TearDown() override;
+};
+
+
+class NodeZeroIsolateTestFixture : public ::testing::Test {
  protected:
-  static ArrayBufferUniquePtr allocator;
-  static TracingAgentUniquePtr tracing_agent;
-  static NodePlatformUniquePtr platform;
   static uv_loop_t current_loop;
   static bool node_initialized;
-  v8::Isolate* isolate_;
+  static ArrayBufferUniquePtr allocator;
+  static NodePlatformUniquePtr platform;
+  static TracingAgentUniquePtr tracing_agent;
 
   static void SetUpTestCase() {
     if (!node_initialized) {
       node_initialized = true;
-      int argc = 1;
-      const char* argv0 = "cctest";
-      int exec_argc;
-      const char** exec_argv;
-      node::Init(&argc, &argv0, &exec_argc, &exec_argv);
-    }
+      uv_os_unsetenv("NODE_OPTIONS");
+      std::vector<std::string> argv { "cctest" };
+      std::vector<std::string> exec_argv;
+      std::vector<std::string> errors;
 
-    tracing_agent = std::make_unique<node::tracing::Agent>();
-    node::tracing::TraceEventHelper::SetAgent(tracing_agent.get());
+      int exitcode = node::InitializeNodeWithArgs(&argv, &exec_argv, &errors);
+      CHECK_EQ(exitcode, 0);
+      CHECK(errors.empty());
+    }
     CHECK_EQ(0, uv_loop_init(&current_loop));
-    platform.reset(static_cast<node::NodePlatform*>(
-          node::InitializeV8Platform(4)));
-    v8::V8::Initialize();
   }
 
   static void TearDownTestCase() {
-    platform->Shutdown();
     while (uv_loop_alive(&current_loop)) {
       uv_run(&current_loop, UV_RUN_ONCE);
     }
-    v8::V8::ShutdownPlatform();
     CHECK_EQ(0, uv_loop_close(&current_loop));
   }
 
   void SetUp() override {
     allocator = ArrayBufferUniquePtr(node::CreateArrayBufferAllocator(),
                                      &node::FreeArrayBufferAllocator);
-    isolate_ = NewIsolate(allocator.get(), &current_loop);
-    CHECK_NE(isolate_, nullptr);
+  }
+
+  friend NodeTestEnvironment;
+};
+
+
+class NodeTestFixture : public NodeZeroIsolateTestFixture {
+ protected:
+  v8::Isolate* isolate_;
+
+  void SetUp() override {
+    NodeZeroIsolateTestFixture::SetUp();
+    isolate_ = NewIsolate(allocator.get(), &current_loop, platform.get());
+    CHECK_NOT_NULL(isolate_);
     isolate_->Enter();
   }
 
   void TearDown() override {
-    isolate_->Exit();
-    isolate_->Dispose();
     platform->DrainTasks(isolate_);
+    isolate_->Exit();
     platform->UnregisterIsolate(isolate_);
+    isolate_->Dispose();
     isolate_ = nullptr;
+    NodeZeroIsolateTestFixture::TearDown();
   }
 };
 
@@ -118,7 +133,10 @@ class EnvironmentTestFixture : public NodeTestFixture {
  public:
   class Env {
    public:
-    Env(const v8::HandleScope& handle_scope, const Argv& argv) {
+    Env(const v8::HandleScope& handle_scope,
+        const Argv& argv,
+        node::EnvironmentFlags::Flags flags =
+            node::EnvironmentFlags::kDefaultFlags) {
       auto isolate = handle_scope.GetIsolate();
       context_ = node::NewContext(isolate);
       CHECK(!context_.IsEmpty());
@@ -128,10 +146,13 @@ class EnvironmentTestFixture : public NodeTestFixture {
                                               &NodeTestFixture::current_loop,
                                               platform.get());
       CHECK_NE(nullptr, isolate_data_);
+      std::vector<std::string> args(*argv, *argv + 1);
+      std::vector<std::string> exec_args(*argv, *argv + 1);
       environment_ = node::CreateEnvironment(isolate_data_,
                                              context_,
-                                             1, *argv,
-                                             argv.nr_args(), *argv);
+                                             args,
+                                             exec_args,
+                                             flags);
       CHECK_NE(nullptr, environment_);
     }
 

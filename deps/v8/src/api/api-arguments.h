@@ -5,6 +5,7 @@
 #ifndef V8_API_API_ARGUMENTS_H_
 #define V8_API_API_ARGUMENTS_H_
 
+#include "include/v8-template.h"
 #include "src/api/api.h"
 #include "src/debug/debug.h"
 #include "src/execution/isolate.h"
@@ -74,6 +75,12 @@ class PropertyCallbackArguments
   PropertyCallbackArguments(Isolate* isolate, Object data, Object self,
                             JSObject holder, Maybe<ShouldThrow> should_throw);
 
+  // Don't copy PropertyCallbackArguments, because they would both have the
+  // same prev_ pointer.
+  PropertyCallbackArguments(const PropertyCallbackArguments&) = delete;
+  PropertyCallbackArguments& operator=(const PropertyCallbackArguments&) =
+      delete;
+
   // -------------------------------------------------------------------------
   // Accessor Callbacks
   // Also used for AccessorSetterCallback.
@@ -141,10 +148,6 @@ class PropertyCallbackArguments
 
   inline JSObject holder();
   inline Object receiver();
-
-  // Don't copy PropertyCallbackArguments, because they would both have the
-  // same prev_ pointer.
-  DISALLOW_COPY_AND_ASSIGN(PropertyCallbackArguments);
 };
 
 class FunctionCallbackArguments
@@ -160,11 +163,9 @@ class FunctionCallbackArguments
   static const int kIsolateIndex = T::kIsolateIndex;
   static const int kNewTargetIndex = T::kNewTargetIndex;
 
-  FunctionCallbackArguments(internal::Isolate* isolate, internal::Object data,
-                            internal::HeapObject callee,
-                            internal::Object holder,
-                            internal::HeapObject new_target,
-                            internal::Address* argv, int argc);
+  FunctionCallbackArguments(Isolate* isolate, Object data, HeapObject callee,
+                            Object holder, HeapObject new_target, Address* argv,
+                            int argc);
 
   /*
    * The following Call function wraps the calling of all callbacks to handle
@@ -177,7 +178,7 @@ class FunctionCallbackArguments
   inline Handle<Object> Call(CallHandlerInfo handler);
 
  private:
-  inline JSObject holder();
+  inline JSReceiver holder();
 
   internal::Address* argv_;
   int argc_;

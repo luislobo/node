@@ -15,6 +15,7 @@ WPT harness and have automatic updates. There are also a few
 This folder covers the tests that have been migrated.
 
 <a id="add-tests"></a>
+
 ## How to add tests for a new module
 
 ### 1. Create a status file
@@ -45,23 +46,20 @@ For example, for the URL tests, add a file `test/wpt/test-url.js`:
 ```js
 'use strict';
 
-// This flag is required by the WPT Runner to patch the internals
-// for the tests to run in a vm.
-// Flags: --expose-internals
-
 require('../common');
 const { WPTRunner } = require('../common/wpt');
 
 const runner = new WPTRunner('url');
 
-// Copy global descriptors from the global object
-runner.copyGlobalsFromObject(global, ['URL', 'URLSearchParams']);
-// Define any additional globals with descriptors
-runner.defineGlobal('DOMException', {
-  get() {
-    return require('internal/domexception');
-  }
-});
+// Set Node.js flags required for the tests.
+runner.setFlags(['--expose-internals']);
+
+// Set a script that will be executed in the worker before running the tests.
+runner.setInitScript(`
+  const { internalBinding } = require('internal/test/binding');
+  const { DOMException } = internalBinding('messaging');
+  global.DOMException = DOMException;
+`);
 
 runner.runJsTests();
 ```
@@ -82,7 +80,7 @@ To run a specific test in WPT, for example, `url/url-searchparams.any.js`,
 pass the file name as argument to the corresponding test driver:
 
 ```text
-node --expose-internals test/wpt/test-url.js url-searchparams.any.js
+node test/wpt/test-url.js url-searchparams.any.js
 ```
 
 If there are any failures, update the corresponding status file
@@ -93,7 +91,11 @@ add this to `test/wpt/status/url.json`:
 
 ```json
   "url-searchparams.any.js": {
-    "fail": "explain why the test fails, ideally with links"
+    "fail": {
+      "expected": [
+        "test name in the WPT test case, e.g. second argument passed to test()"
+      ]
+    }
   }
 ```
 
@@ -138,13 +140,14 @@ loads:
 * Status file (for example, `test/wpt/status/url.json` for `url`)
 * The WPT harness
 
-Then, for each test, it creates a vm with the globals and mocks,
+Then, for each test, it creates a worker thread with the globals and mocks,
 sets up the harness result hooks, loads the metadata in the test (including
-loading extra resources), and runs all the tests in that vm,
+loading extra resources), and runs all the tests in that worker thread,
 skipping tests that cannot be run because of lack of dependency or
 expected failures.
 
 <a id="status-format"></a>
+
 ## Format of a status JSON file
 
 ```text
@@ -156,8 +159,17 @@ expected failures.
     // Optional: the test will be skipped with the reason printed
     "skip": "explain why we cannot run a test that's supposed to pass",
 
-    // Optional: the test will be skipped with the reason printed
-    "fail": "explain why we the test is expected to fail"
+    // Optional: failing tests
+    "fail": {
+      "note": "You may leave an optional arbitrary note e.g. with TODOs",
+      "expected": [
+        "test name in the WPT test case, e.g. second argument passed to test()",
+        "another test name"
+      ],
+      "flaky": [
+        "flaky test name"
+      ]
+    }
   }
 }
 ```
@@ -167,5 +179,5 @@ Web API, or certain harness has not been ported in our test runner yet.
 In that case it needs to be marked with `skip` instead of `fail`.
 
 [Web Platform Tests]: https://github.com/web-platform-tests/wpt
-[git node wpt]: https://github.com/nodejs/node-core-utils/blob/master/docs/git-node.md#git-node-wpt
 [`test/fixtures/wpt/README.md`]: ../fixtures/wpt/README.md
+[git node wpt]: https://github.com/nodejs/node-core-utils/blob/HEAD/docs/git-node.md#git-node-wpt

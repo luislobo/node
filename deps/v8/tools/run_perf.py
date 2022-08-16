@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # Copyright 2014 the V8 project authors. All rights reserved.
 # Use of this source code is governed by a BSD-style license that can be
 # found in the LICENSE file.
@@ -102,11 +103,9 @@ Path pieces are concatenated. D8 is always run with the suite's path as cwd.
 The test flags are passed to the js test file after '--'.
 """
 
-# for py2/py3 compatibility
-from __future__ import print_function
-from functools import reduce
-
 from collections import OrderedDict
+from math import sqrt
+from statistics import mean, stdev
 import copy
 import json
 import logging
@@ -119,24 +118,19 @@ import sys
 import time
 import traceback
 
-import numpy
-
 from testrunner.local import android
 from testrunner.local import command
 from testrunner.local import utils
 from testrunner.objects.output import Output, NULL_OUTPUT
 
-try:
-  basestring       # Python 2
-except NameError:  # Python 3
-  basestring = str
 
 SUPPORTED_ARCHS = ['arm',
                    'ia32',
                    'mips',
                    'mipsel',
                    'x64',
-                   'arm64']
+                   'arm64',
+                   'riscv64']
 
 GENERIC_RESULTS_RE = re.compile(r'^RESULT ([^:]+): ([^=]+)= ([^ ]+) ([^ ]*)$')
 RESULT_STDDEV_RE = re.compile(r'^\{([^\}]+)\}$')
@@ -151,7 +145,7 @@ def GeometricMean(values):
 
   The mean is calculated using log to avoid overflow.
   """
-  values = map(float, values)
+  values = list(map(float, values))
   return math.exp(sum(map(math.log, values)) / len(values))
 
 
@@ -223,9 +217,9 @@ class ResultTracker(object):
 
   def ToDict(self):
     return {
-        'traces': self.traces.values(),
+        'traces': list(self.traces.values()),
         'errors': self.errors,
-        'runnables': self.runnables.values(),
+        'runnables': list(self.runnables.values()),
     }
 
   def WriteToFile(self, file_name):
@@ -263,11 +257,12 @@ class ResultTracker(object):
       return False
 
     logging.debug('  Results: %d entries', len(results))
-    mean = numpy.mean(results)
-    mean_stderr = numpy.std(results) / numpy.sqrt(len(results))
-    logging.debug('  Mean: %.2f, mean_stderr: %.2f', mean, mean_stderr)
-    logging.info('>>> Confidence level is %.2f', mean / (1000.0 * mean_stderr))
-    return confidence_level * mean_stderr < mean / 1000.0
+    avg = mean(results)
+    avg_stderr = stdev(results) / sqrt(len(results))
+    logging.debug('  Mean: %.2f, mean_stderr: %.2f', avg, avg_stderr)
+    logging.info('>>> Confidence level is %.2f',
+                 avg / max(1000.0 * avg_stderr, .1))
+    return confidence_level * avg_stderr < avg / 1000.0
 
   def __str__(self):  # pragma: no cover
     return json.dumps(self.ToDict(), indent=2, separators=(',', ': '))
@@ -287,7 +282,8 @@ def RunResultsProcessor(results_processor, output, count):
       stderr=subprocess.PIPE,
   )
   new_output = copy.copy(output)
-  new_output.stdout, _ = p.communicate(input=output.stdout)
+  new_output.stdout = p.communicate(
+      input=output.stdout.encode('utf-8'))[0].decode('utf-8')
   logging.info('>>> Processed stdout (#%d):\n%s', count, output.stdout)
   return new_output
 
@@ -338,7 +334,7 @@ class GraphConfig(Node):
 
     assert isinstance(suite.get('path', []), list)
     assert isinstance(suite.get('owners', []), list)
-    assert isinstance(suite['name'], basestring)
+    assert isinstance(suite['name'], str)
     assert isinstance(suite.get('flags', []), list)
     assert isinstance(suite.get('test_flags', []), list)
     assert isinstance(suite.get('resources', []), list)
@@ -457,7 +453,9 @@ class RunnableConfig(GraphConfig):
     """
     suite_dir = os.path.abspath(os.path.dirname(suite_path))
     bench_dir = os.path.normpath(os.path.join(*self.path))
-    os.chdir(os.path.join(suite_dir, bench_dir))
+    cwd = os.path.join(suite_dir, bench_dir)
+    logging.debug('Changing CWD to: %s' % cwd)
+    os.chdir(cwd)
 
   def GetCommandFlags(self, extra_flags=None):
     suffix = ['--'] + self.test_flags if self.test_flags else []
@@ -479,7 +477,8 @@ class RunnableConfig(GraphConfig):
         cmd_prefix=cmd_prefix,
         shell=os.path.join(shell_dir, self.binary),
         args=self.GetCommandFlags(extra_flags=extra_flags),
-        timeout=self.timeout or 60)
+        timeout=self.timeout or 60,
+        handle_sigterm=True)
 
   def ProcessOutput(self, output, result_tracker, count):
     """Processes test run output and updates result tracker.
@@ -574,6 +573,34 @@ def FlattenRunnables(node, node_cb):
     raise Exception('Invalid suite configuration.')
 
 
+def find_build_directory(base_path, arch):
+  """Returns the location of d8 or node in the build output directory.
+
+  This supports a seamless transition between legacy build location
+  (out/Release) and new build location (out/build).
+  """
+  def is_build(path):
+    # We support d8 or node as executables. We don't support testing on
+    # Windows.
+    return (os.path.isfile(os.path.join(path, 'd8')) or
+            os.path.isfile(os.path.join(path, 'node')))
+  possible_paths = [
+    # Location developer wrapper scripts is using.
+    '%s.release' % arch,
+    # Current build location on bots.
+    'build',
+    # Legacy build location on bots.
+    'Release',
+  ]
+  possible_paths = [os.path.join(base_path, p) for p in possible_paths]
+  actual_paths = list(filter(is_build, possible_paths))
+  assert actual_paths, 'No build directory found.'
+  assert len(
+      actual_paths
+  ) == 1, 'Found ambiguous build directories use --binary-override-path.'
+  return actual_paths[0]
+
+
 class Platform(object):
   def __init__(self, args):
     self.shell_dir = args.shell_dir
@@ -649,10 +676,10 @@ class DesktopPlatform(Platform):
       if args.prioritize:
         self.command_prefix += ['-n', '-20']
       if args.affinitize != None:
-      # schedtool expects a bit pattern when setting affinity, where each
-      # bit set to '1' corresponds to a core where the process may run on.
-      # First bit corresponds to CPU 0. Since the 'affinitize' parameter is
-      # a core number, we need to map to said bit pattern.
+        # schedtool expects a bit pattern when setting affinity, where each
+        # bit set to '1' corresponds to a core where the process may run on.
+        # First bit corresponds to CPU 0. Since the 'affinitize' parameter is
+        # a core number, we need to map to said bit pattern.
         cpu = int(args.affinitize)
         core = 1 << cpu
         self.command_prefix += ['-a', ('0x%x' % core)]
@@ -671,6 +698,7 @@ class DesktopPlatform(Platform):
   def _Run(self, runnable, count, secondary=False):
     shell_dir = self.shell_dir_secondary if secondary else self.shell_dir
     cmd = runnable.GetCommand(self.command_prefix, shell_dir, self.extra_flags)
+    logging.debug('Running command: %s' % cmd)
     output = cmd.execute()
 
     if output.IsSuccess() and '--prof' in self.extra_flags:
@@ -813,10 +841,10 @@ class CustomMachineConfiguration:
     try:
       with open('/sys/devices/system/cpu/present', 'r') as f:
         indexes = f.readline()
-        r = map(int, indexes.split('-'))
+        r = list(map(int, indexes.split('-')))
         if len(r) == 1:
-          return range(r[0], r[0] + 1)
-        return range(r[0], r[1] + 1)
+          return list(range(r[0], r[0] + 1))
+        return list(range(r[0], r[1] + 1))
     except Exception:
       logging.exception('Failed to retrieve number of CPUs.')
       raise
@@ -880,8 +908,7 @@ def Main(argv):
                       'to auto-detect.', default='x64',
                       choices=SUPPORTED_ARCHS + ['auto'])
   parser.add_argument('--buildbot',
-                      help='Adapt to path structure used on buildbots and adds '
-                      'timestamps/level to all logged status messages',
+                      help='Deprecated',
                       default=False, action='store_true')
   parser.add_argument('-d', '--device',
                       help='The device ID to run Android tests on. If not '
@@ -977,13 +1004,9 @@ def Main(argv):
 
   workspace = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 
-  if args.buildbot:
-    build_config = 'Release'
-  else:
-    build_config = '%s.release' % args.arch
-
   if args.binary_override_path == None:
-    args.shell_dir = os.path.join(workspace, args.outdir, build_config)
+    args.shell_dir = find_build_directory(
+        os.path.join(workspace, args.outdir), args.arch)
     default_binary_name = 'd8'
   else:
     if not os.path.isfile(args.binary_override_path):
@@ -997,8 +1020,8 @@ def Main(argv):
     default_binary_name = os.path.basename(args.binary_override_path)
 
   if args.outdir_secondary:
-    args.shell_dir_secondary = os.path.join(
-        workspace, args.outdir_secondary, build_config)
+    args.shell_dir_secondary = find_build_directory(
+        os.path.join(workspace, args.outdir_secondary), args.arch)
   else:
     args.shell_dir_secondary = None
 
@@ -1011,7 +1034,7 @@ def Main(argv):
 
   # Ensure all arguments have absolute path before we start changing current
   # directory.
-  args.suite = map(os.path.abspath, args.suite)
+  args.suite = list(map(os.path.abspath, args.suite))
 
   prev_aslr = None
   prev_cpu_gov = None

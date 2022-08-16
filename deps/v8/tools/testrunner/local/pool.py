@@ -1,10 +1,7 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # Copyright 2014 the V8 project authors. All rights reserved.
 # Use of this source code is governed by a BSD-style license that can be
 # found in the LICENSE file.
-
-# for py2/py3 compatibility
-from __future__ import print_function
 
 from contextlib import contextmanager
 from multiprocessing import Process, Queue
@@ -19,6 +16,7 @@ except ImportError:
   from Queue import Empty  # Python 2
 
 from . import command
+from . import utils
 
 
 def setup_testing():
@@ -195,10 +193,10 @@ class Pool():
             # gracefully, e.g. missing test files.
             internal_error = True
             continue
-
-          if self.abort_now:
-            # SIGINT, SIGTERM or internal hard timeout.
-            return
+          finally:
+            if self.abort_now:
+              # SIGINT, SIGTERM or internal hard timeout.
+              return
 
           yield result
           break
@@ -243,6 +241,13 @@ class Pool():
     """
     self.abort_now = True
 
+  def _terminate_processes(self):
+    for p in self.processes:
+      if utils.IsWindows():
+        command.taskkill_windows(p, verbose=True, force=False)
+      else:
+        os.kill(p.pid, signal.SIGTERM)
+
   def _terminate(self):
     """Terminates execution and cleans up the queues.
 
@@ -267,8 +272,7 @@ class Pool():
       self.work_queue.put("STOP")
 
     if self.abort_now:
-      for p in self.processes:
-        os.kill(p.pid, signal.SIGTERM)
+      self._terminate_processes()
 
     self.notify("Joining workers")
     for p in self.processes:

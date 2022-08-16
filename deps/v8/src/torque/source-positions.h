@@ -30,13 +30,27 @@ class SourceId {
 };
 
 struct LineAndColumn {
+  static constexpr int kUnknownOffset = -1;
+
+  int offset;
   int line;
   int column;
 
-  static LineAndColumn Invalid() { return {-1, -1}; }
+  static LineAndColumn Invalid() { return {-1, -1, -1}; }
+  static LineAndColumn WithUnknownOffset(int line, int column) {
+    return {kUnknownOffset, line, column};
+  }
 
   bool operator==(const LineAndColumn& other) const {
-    return line == other.line && column == other.column;
+    if (offset == kUnknownOffset || other.offset == kUnknownOffset) {
+      return line == other.line && column == other.column;
+    }
+    DCHECK_EQ(offset == other.offset,
+              line == other.line && column == other.column);
+    return offset == other.offset;
+  }
+  bool operator!=(const LineAndColumn& other) const {
+    return !operator==(other);
   }
 };
 
@@ -66,6 +80,7 @@ struct SourcePosition {
   bool operator==(const SourcePosition& pos) const {
     return source == pos.source && start == pos.start && end == pos.end;
   }
+  bool operator!=(const SourcePosition& pos) const { return !(*this == pos); }
 };
 
 DECLARE_CONTEXTUAL_VARIABLE(CurrentSourceFile, SourceId);
@@ -94,7 +109,10 @@ inline std::string PositionAsString(SourcePosition pos) {
 }
 
 inline std::ostream& operator<<(std::ostream& out, SourcePosition pos) {
-  return out << PositionAsString(pos);
+  return out << "https://source.chromium.org/chromium/chromium/src/+/main:v8/"
+             << SourceFileMap::PathFromV8Root(pos.source)
+             << "?l=" << (pos.start.line + 1)
+             << "&c=" << (pos.start.column + 1);
 }
 
 }  // namespace torque

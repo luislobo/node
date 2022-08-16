@@ -27,7 +27,9 @@
 // Decodes a v8::Local<v8::String> or Buffer to a raw char*
 
 #include "v8.h"
-#include "env.h"
+#include "env-inl.h"
+
+#include <string>
 
 namespace node {
 
@@ -73,8 +75,7 @@ class StringBytes {
                       char* buf,
                       size_t buflen,
                       v8::Local<v8::Value> val,
-                      enum encoding enc,
-                      int* chars_written = nullptr);
+                      enum encoding enc);
 
   // Take the bytes in the src, and turn it into a Buffer or String.
   static v8::MaybeLocal<v8::Value> Encode(v8::Isolate* isolate,
@@ -97,13 +98,19 @@ class StringBytes {
                                           enum encoding encoding,
                                           v8::Local<v8::Value>* error);
 
+  static size_t hex_encode(const char* src,
+                           size_t slen,
+                           char* dst,
+                           size_t dlen);
+
+  static std::string hex_encode(const char* src, size_t slen);
+
  private:
   static size_t WriteUCS2(v8::Isolate* isolate,
                           char* buf,
                           size_t buflen,
                           v8::Local<v8::String> str,
-                          int flags,
-                          size_t* chars_written);
+                          int flags);
 };
 
 }  // namespace node

@@ -1,4 +1,5 @@
 #include "env-inl.h"
+#include "node_external_reference.h"
 #include "util-inl.h"
 #include "v8.h"
 
@@ -7,11 +8,9 @@
 namespace node {
 namespace {
 
-using v8::Array;
 using v8::Context;
 using v8::Function;
 using v8::FunctionCallbackInfo;
-using v8::Integer;
 using v8::Local;
 using v8::Object;
 using v8::Value;
@@ -49,19 +48,28 @@ void Initialize(Local<Object> target,
                        void* priv) {
   Environment* env = Environment::GetCurrent(context);
 
-  env->SetMethod(target, "getLibuvNow", GetLibuvNow);
-  env->SetMethod(target, "setupTimers", SetupTimers);
-  env->SetMethod(target, "scheduleTimer", ScheduleTimer);
-  env->SetMethod(target, "toggleTimerRef", ToggleTimerRef);
-  env->SetMethod(target, "toggleImmediateRef", ToggleImmediateRef);
+  SetMethod(context, target, "getLibuvNow", GetLibuvNow);
+  SetMethod(context, target, "setupTimers", SetupTimers);
+  SetMethod(context, target, "scheduleTimer", ScheduleTimer);
+  SetMethod(context, target, "toggleTimerRef", ToggleTimerRef);
+  SetMethod(context, target, "toggleImmediateRef", ToggleImmediateRef);
 
-  target->Set(env->context(),
-              FIXED_ONE_BYTE_STRING(env->isolate(), "immediateInfo"),
-              env->immediate_info()->fields().GetJSArray()).Check();
+  target
+      ->Set(context,
+            FIXED_ONE_BYTE_STRING(env->isolate(), "immediateInfo"),
+            env->immediate_info()->fields().GetJSArray())
+      .Check();
+}
+}  // anonymous namespace
+void RegisterTimerExternalReferences(ExternalReferenceRegistry* registry) {
+  registry->Register(GetLibuvNow);
+  registry->Register(SetupTimers);
+  registry->Register(ScheduleTimer);
+  registry->Register(ToggleTimerRef);
+  registry->Register(ToggleImmediateRef);
 }
 
-
-}  // anonymous namespace
 }  // namespace node
 
 NODE_MODULE_CONTEXT_AWARE_INTERNAL(timers, node::Initialize)
+NODE_MODULE_EXTERNAL_REFERENCE(timers, node::RegisterTimerExternalReferences)

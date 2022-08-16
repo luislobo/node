@@ -12,6 +12,7 @@
 #include <limits>
 #include <string>
 
+#include "../../third_party/inspector_protocol/crdtp/cbor.h"
 #include "src/base/platform/platform.h"
 #include "src/inspector/v8-string-conversions.h"
 #include "src/numbers/conversions.h"
@@ -67,8 +68,8 @@ String16::String16(std::basic_string<UChar>&& impl) : m_impl(impl) {}
 // static
 String16 String16::fromInteger(int number) {
   char arr[50];
-  v8::internal::Vector<char> buffer(arr, arraysize(arr));
-  return String16(IntToCString(number, buffer));
+  v8::base::Vector<char> buffer(arr, arraysize(arr));
+  return String16(v8::internal::IntToCString(number, buffer));
 }
 
 // static
@@ -84,10 +85,17 @@ String16 String16::fromInteger(size_t number) {
 }
 
 // static
+String16 String16::fromInteger64(int64_t number) {
+  char buffer[50];
+  v8::base::OS::SNPrintF(buffer, arraysize(buffer), "%" PRId64 "", number);
+  return String16(buffer);
+}
+
+// static
 String16 String16::fromDouble(double number) {
   char arr[50];
-  v8::internal::Vector<char> buffer(arr, arraysize(arr));
-  return String16(DoubleToCString(number, buffer));
+  v8::base::Vector<char> buffer(arr, arraysize(arr));
+  return String16(v8::internal::DoubleToCString(number, buffer));
 }
 
 // static
@@ -184,6 +192,14 @@ void String16Builder::appendUnsignedAsHex(uint32_t number) {
   constexpr int kBufferSize = 9;
   char buffer[kBufferSize];
   int chars = v8::base::OS::SNPrintF(buffer, kBufferSize, "%08" PRIx32, number);
+  DCHECK_LE(0, chars);
+  m_buffer.insert(m_buffer.end(), buffer, buffer + chars);
+}
+
+void String16Builder::appendUnsignedAsHex(uint8_t number) {
+  constexpr int kBufferSize = 3;
+  char buffer[kBufferSize];
+  int chars = v8::base::OS::SNPrintF(buffer, kBufferSize, "%02" PRIx8, number);
   DCHECK_LE(0, chars);
   m_buffer.insert(m_buffer.end(), buffer, buffer + chars);
 }

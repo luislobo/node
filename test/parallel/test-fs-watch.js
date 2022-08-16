@@ -1,6 +1,9 @@
 'use strict';
 const common = require('../common');
 
+if (common.isIBMi)
+  common.skip('IBMi does not support `fs.watch()`');
+
 // Tests if `filename` is provided to watcher on supported platforms
 
 const fs = require('fs');
@@ -19,20 +22,20 @@ class WatchTestCase {
 }
 
 const cases = [
-  // Watch on a directory should callback with a filename on supported systems
+  // Watch on a file should callback with a filename on supported systems
   new WatchTestCase(
     common.isLinux || common.isOSX || common.isWindows || common.isAIX,
     'watch1',
     'foo',
     'filePath'
   ),
-  // Watch on a file should callback with a filename on supported systems
+  // Watch on a directory should callback with a filename on supported systems
   new WatchTestCase(
     common.isLinux || common.isOSX || common.isWindows,
     'watch2',
     'bar',
     'dirPath'
-  )
+  ),
 ];
 
 const tmpdir = require('../common/tmpdir');
@@ -85,13 +88,11 @@ for (const testCase of cases) {
 }
 
 [false, 1, {}, [], null, undefined].forEach((input) => {
-  common.expectsError(
+  assert.throws(
     () => fs.watch(input, common.mustNotCall()),
     {
       code: 'ERR_INVALID_ARG_TYPE',
-      type: TypeError,
-      message: 'The "filename" argument must be one of type string, Buffer, ' +
-               `or URL. Received type ${typeof input}`
+      name: 'TypeError'
     }
   );
 });

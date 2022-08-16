@@ -90,26 +90,6 @@ Running test: testScopesPaused
         scopeChain : [
             [0] : {
                 endLocation : {
-                    columnNumber : 13
-                    lineNumber : 14
-                    scriptId : <scriptId>
-                }
-                name : run
-                object : {
-                    className : Object
-                    description : Object
-                    objectId : <objectId>
-                    type : object
-                }
-                startLocation : {
-                    columnNumber : 4
-                    lineNumber : 12
-                    scriptId : <scriptId>
-                }
-                type : local
-            }
-            [1] : {
-                endLocation : {
                     columnNumber : 3
                     lineNumber : 15
                     scriptId : <scriptId>
@@ -122,13 +102,13 @@ Running test: testScopesPaused
                     type : object
                 }
                 startLocation : {
-                    columnNumber : 9
+                    columnNumber : 2
                     lineNumber : 11
                     scriptId : <scriptId>
                 }
-                type : block
+                type : local
             }
-            [2] : {
+            [1] : {
                 endLocation : {
                     columnNumber : 1
                     lineNumber : 19
@@ -148,7 +128,7 @@ Running test: testScopesPaused
                 }
                 type : local
             }
-            [3] : {
+            [2] : {
                 object : {
                     className : global
                     description : global
@@ -203,8 +183,8 @@ Running test: testScopesPaused
     [0] : {
         callFrameId : <callFrameId>
         functionLocation : {
-            columnNumber : 4
-            lineNumber : 12
+            columnNumber : 2
+            lineNumber : 11
             scriptId : <scriptId>
         }
         functionName : <instance_members_initializer>
@@ -384,8 +364,8 @@ Running test: testScopesPaused
     [0] : {
         callFrameId : <callFrameId>
         functionLocation : {
-            columnNumber : 4
-            lineNumber : 12
+            columnNumber : 2
+            lineNumber : 11
             scriptId : <scriptId>
         }
         functionName : <instance_members_initializer>
@@ -565,8 +545,8 @@ Running test: testScopesPaused
     [0] : {
         callFrameId : <callFrameId>
         functionLocation : {
-            columnNumber : 4
-            lineNumber : 12
+            columnNumber : 2
+            lineNumber : 11
             scriptId : <scriptId>
         }
         functionName : <instance_members_initializer>
@@ -818,8 +798,8 @@ Running test: testScopesPaused
     [1] : {
         callFrameId : <callFrameId>
         functionLocation : {
-            columnNumber : 4
-            lineNumber : 12
+            columnNumber : 2
+            lineNumber : 11
             scriptId : <scriptId>
         }
         functionName : <instance_members_initializer>

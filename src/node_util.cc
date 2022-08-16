@@ -1,6 +1,7 @@
-#include "node_errors.h"
-#include "util-inl.h"
 #include "base_object-inl.h"
+#include "node_errors.h"
+#include "node_external_reference.h"
+#include "util-inl.h"
 
 namespace node {
 namespace util {
@@ -8,9 +9,10 @@ namespace util {
 using v8::ALL_PROPERTIES;
 using v8::Array;
 using v8::ArrayBufferView;
+using v8::BigInt;
 using v8::Boolean;
 using v8::Context;
-using v8::Function;
+using v8::External;
 using v8::FunctionCallbackInfo;
 using v8::FunctionTemplate;
 using v8::Global;
@@ -32,6 +34,18 @@ using v8::SKIP_SYMBOLS;
 using v8::String;
 using v8::Uint32;
 using v8::Value;
+
+// Used in ToUSVString().
+constexpr char16_t kUnicodeReplacementCharacter = 0xFFFD;
+
+// If a UTF-16 character is a low/trailing surrogate.
+CHAR_TEST(16, IsUnicodeTrail, (ch & 0xFC00) == 0xDC00)
+
+// If a UTF-16 character is a surrogate.
+CHAR_TEST(16, IsUnicodeSurrogate, (ch & 0xF800) == 0xD800)
+
+// If a UTF-16 surrogate is a low/trailing one.
+CHAR_TEST(16, IsUnicodeSurrogateTrail, (ch & 0x400) != 0)
 
 static void GetOwnNonIndexProperties(
     const FunctionCallbackInfo<Value>& args) {
@@ -68,6 +82,18 @@ static void GetConstructorName(
   args.GetReturnValue().Set(name);
 }
 
+static void GetExternalValue(
+    const FunctionCallbackInfo<Value>& args) {
+  CHECK(args[0]->IsExternal());
+  Isolate* isolate = args.GetIsolate();
+  Local<External> external = args[0].As<External>();
+
+  void* ptr = external->Value();
+  uint64_t value = reinterpret_cast<uint64_t>(ptr);
+  Local<BigInt> ret = BigInt::NewFromUnsigned(isolate, value);
+  args.GetReturnValue().Set(ret);
+}
+
 static void GetPromiseDetails(const FunctionCallbackInfo<Value>& args) {
   // Return undefined if it's not a Promise.
   if (!args[0]->IsPromise())
@@ -93,13 +119,22 @@ static void GetProxyDetails(const FunctionCallbackInfo<Value>& args) {
 
   Local<Proxy> proxy = args[0].As<Proxy>();
 
-  Local<Value> ret[] = {
-    proxy->GetTarget(),
-    proxy->GetHandler()
-  };
+  // TODO(BridgeAR): Remove the length check as soon as we prohibit access to
+  // the util binding layer. It's accessed in the wild and `esm` would break in
+  // case the check is removed.
+  if (args.Length() == 1 || args[1]->IsTrue()) {
+    Local<Value> ret[] = {
+      proxy->GetTarget(),
+      proxy->GetHandler()
+    };
 
-  args.GetReturnValue().Set(
-      Array::New(args.GetIsolate(), ret, arraysize(ret)));
+    args.GetReturnValue().Set(
+        Array::New(args.GetIsolate(), ret, arraysize(ret)));
+  } else {
+    Local<Value> ret = proxy->GetTarget();
+
+    args.GetReturnValue().Set(ret);
+  }
 }
 
 static void PreviewEntries(const FunctionCallbackInfo<Value>& args) {
@@ -140,11 +175,11 @@ static void GetHiddenValue(const FunctionCallbackInfo<Value>& args) {
   CHECK(args[1]->IsUint32());
 
   Local<Object> obj = args[0].As<Object>();
-  auto index = args[1]->Uint32Value(env->context()).FromJust();
-  auto private_symbol = IndexToPrivateSymbol(env, index);
-  auto maybe_value = obj->GetPrivate(env->context(), private_symbol);
-
-  args.GetReturnValue().Set(maybe_value.ToLocalChecked());
+  uint32_t index = args[1].As<Uint32>()->Value();
+  Local<Private> private_symbol = IndexToPrivateSymbol(env, index);
+  Local<Value> ret;
+  if (obj->GetPrivate(env->context(), private_symbol).ToLocal(&ret))
+    args.GetReturnValue().Set(ret);
 }
 
 static void SetHiddenValue(const FunctionCallbackInfo<Value>& args) {
@@ -154,11 +189,17 @@ static void SetHiddenValue(const FunctionCallbackInfo<Value>& args) {
   CHECK(args[1]->IsUint32());
 
   Local<Object> obj = args[0].As<Object>();
-  auto index = args[1]->Uint32Value(env->context()).FromJust();
-  auto private_symbol = IndexToPrivateSymbol(env, index);
-  auto maybe_value = obj->SetPrivate(env->context(), private_symbol, args[2]);
+  uint32_t index = args[1].As<Uint32>()->Value();
+  Local<Private> private_symbol = IndexToPrivateSymbol(env, index);
+  bool ret;
+  if (obj->SetPrivate(env->context(), private_symbol, args[2]).To(&ret))
+    args.GetReturnValue().Set(ret);
+}
 
-  args.GetReturnValue().Set(maybe_value.FromJust());
+static void Sleep(const FunctionCallbackInfo<Value>& args) {
+  CHECK(args[0]->IsUint32());
+  uint32_t msec = args[0].As<Uint32>()->Value();
+  uv_sleep(msec);
 }
 
 void ArrayBufferViewHasBuffer(const FunctionCallbackInfo<Value>& args) {
@@ -248,11 +289,65 @@ static void GuessHandleType(const FunctionCallbackInfo<Value>& args) {
   args.GetReturnValue().Set(OneByteString(env->isolate(), type));
 }
 
+static void ToUSVString(const FunctionCallbackInfo<Value>& args) {
+  Environment* env = Environment::GetCurrent(args);
+  CHECK_GE(args.Length(), 2);
+  CHECK(args[0]->IsString());
+  CHECK(args[1]->IsNumber());
+
+  TwoByteValue value(env->isolate(), args[0]);
+
+  int64_t start = args[1]->IntegerValue(env->context()).FromJust();
+  CHECK_GE(start, 0);
+
+  for (size_t i = start; i < value.length(); i++) {
+    char16_t c = value[i];
+    if (!IsUnicodeSurrogate(c)) {
+      continue;
+    } else if (IsUnicodeSurrogateTrail(c) || i == value.length() - 1) {
+      value[i] = kUnicodeReplacementCharacter;
+    } else {
+      char16_t d = value[i + 1];
+      if (IsUnicodeTrail(d)) {
+        i++;
+      } else {
+        value[i] = kUnicodeReplacementCharacter;
+      }
+    }
+  }
+
+  args.GetReturnValue().Set(
+      String::NewFromTwoByte(env->isolate(),
+                             *value,
+                             v8::NewStringType::kNormal,
+                             value.length()).ToLocalChecked());
+}
+
+void RegisterExternalReferences(ExternalReferenceRegistry* registry) {
+  registry->Register(GetHiddenValue);
+  registry->Register(SetHiddenValue);
+  registry->Register(GetPromiseDetails);
+  registry->Register(GetProxyDetails);
+  registry->Register(PreviewEntries);
+  registry->Register(GetOwnNonIndexProperties);
+  registry->Register(GetConstructorName);
+  registry->Register(GetExternalValue);
+  registry->Register(Sleep);
+  registry->Register(ArrayBufferViewHasBuffer);
+  registry->Register(WeakReference::New);
+  registry->Register(WeakReference::Get);
+  registry->Register(WeakReference::IncRef);
+  registry->Register(WeakReference::DecRef);
+  registry->Register(GuessHandleType);
+  registry->Register(ToUSVString);
+}
+
 void Initialize(Local<Object> target,
                 Local<Value> unused,
                 Local<Context> context,
                 void* priv) {
   Environment* env = Environment::GetCurrent(context);
+  Isolate* isolate = env->isolate();
 
 #define V(name, _)                                                            \
   target->Set(context,                                                        \
@@ -274,16 +369,21 @@ void Initialize(Local<Object> target,
   V(kRejected);
 #undef V
 
-  env->SetMethodNoSideEffect(target, "getHiddenValue", GetHiddenValue);
-  env->SetMethod(target, "setHiddenValue", SetHiddenValue);
-  env->SetMethodNoSideEffect(target, "getPromiseDetails", GetPromiseDetails);
-  env->SetMethodNoSideEffect(target, "getProxyDetails", GetProxyDetails);
-  env->SetMethodNoSideEffect(target, "previewEntries", PreviewEntries);
-  env->SetMethodNoSideEffect(target, "getOwnNonIndexProperties",
-                                     GetOwnNonIndexProperties);
-  env->SetMethodNoSideEffect(target, "getConstructorName", GetConstructorName);
+  SetMethodNoSideEffect(context, target, "getHiddenValue", GetHiddenValue);
+  SetMethod(context, target, "setHiddenValue", SetHiddenValue);
+  SetMethodNoSideEffect(
+      context, target, "getPromiseDetails", GetPromiseDetails);
+  SetMethodNoSideEffect(context, target, "getProxyDetails", GetProxyDetails);
+  SetMethodNoSideEffect(context, target, "previewEntries", PreviewEntries);
+  SetMethodNoSideEffect(
+      context, target, "getOwnNonIndexProperties", GetOwnNonIndexProperties);
+  SetMethodNoSideEffect(
+      context, target, "getConstructorName", GetConstructorName);
+  SetMethodNoSideEffect(context, target, "getExternalValue", GetExternalValue);
+  SetMethod(context, target, "sleep", Sleep);
 
-  env->SetMethod(target, "arrayBufferViewHasBuffer", ArrayBufferViewHasBuffer);
+  SetMethod(
+      context, target, "arrayBufferViewHasBuffer", ArrayBufferViewHasBuffer);
   Local<Object> constants = Object::New(env->isolate());
   NODE_DEFINE_CONSTANT(constants, ALL_PROPERTIES);
   NODE_DEFINE_CONSTANT(constants, ONLY_WRITABLE);
@@ -298,27 +398,28 @@ void Initialize(Local<Object> target,
   Local<String> should_abort_on_uncaught_toggle =
       FIXED_ONE_BYTE_STRING(env->isolate(), "shouldAbortOnUncaughtToggle");
   CHECK(target
-            ->Set(env->context(),
+            ->Set(context,
                   should_abort_on_uncaught_toggle,
                   env->should_abort_on_uncaught_toggle().GetJSArray())
             .FromJust());
 
-  Local<String> weak_ref_string =
-      FIXED_ONE_BYTE_STRING(env->isolate(), "WeakReference");
   Local<FunctionTemplate> weak_ref =
-      env->NewFunctionTemplate(WeakReference::New);
-  weak_ref->InstanceTemplate()->SetInternalFieldCount(1);
-  weak_ref->SetClassName(weak_ref_string);
-  env->SetProtoMethod(weak_ref, "get", WeakReference::Get);
-  env->SetProtoMethod(weak_ref, "incRef", WeakReference::IncRef);
-  env->SetProtoMethod(weak_ref, "decRef", WeakReference::DecRef);
-  target->Set(context, weak_ref_string,
-              weak_ref->GetFunction(context).ToLocalChecked()).Check();
+      NewFunctionTemplate(isolate, WeakReference::New);
+  weak_ref->InstanceTemplate()->SetInternalFieldCount(
+      WeakReference::kInternalFieldCount);
+  weak_ref->Inherit(BaseObject::GetConstructorTemplate(env));
+  SetProtoMethod(isolate, weak_ref, "get", WeakReference::Get);
+  SetProtoMethod(isolate, weak_ref, "incRef", WeakReference::IncRef);
+  SetProtoMethod(isolate, weak_ref, "decRef", WeakReference::DecRef);
+  SetConstructorFunction(context, target, "WeakReference", weak_ref);
 
-  env->SetMethod(target, "guessHandleType", GuessHandleType);
+  SetMethod(context, target, "guessHandleType", GuessHandleType);
+
+  SetMethodNoSideEffect(context, target, "toUSVString", ToUSVString);
 }
 
 }  // namespace util
 }  // namespace node
 
 NODE_MODULE_CONTEXT_AWARE_INTERNAL(util, node::util::Initialize)
+NODE_MODULE_EXTERNAL_REFERENCE(util, node::util::RegisterExternalReferences)

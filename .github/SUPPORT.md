@@ -15,9 +15,9 @@ If you didn't find an answer in the resources above, try these unofficial
 resources:
 
 * [Questions tagged 'node.js' on Stack Overflow](https://stackoverflow.com/questions/tagged/node.js)
-* [#node.js channel on chat.freenode.net](https://webchat.freenode.net?channels=node.js&uio=d4)
+* [#node.js channel on libera.chat](https://web.libera.chat?channels=node.js&uio=d4)
 * [Node.js Slack Community](https://node-js.slack.com/)
-  * To register: [nodeslackers.com](http://www.nodeslackers.com/)
+  * To register: [nodeslackers.com](https://www.nodeslackers.com/)
 
 GitHub issues are for tracking enhancements and bugs, not general support.
 

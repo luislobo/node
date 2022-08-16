@@ -2,7 +2,7 @@
 
 // Flags: --experimental-vm-modules
 
-require('../common');
+const common = require('../common');
 const { SyntheticModule, SourceTextModule } = require('vm');
 const assert = require('assert');
 
@@ -26,6 +26,17 @@ const assert = require('assert');
     assert.strictEqual(m.namespace.getX(), 42);
   }
 
+  {
+    const s = new SyntheticModule([], () => {
+      const p = Promise.reject();
+      p.catch(() => {});
+      return p;
+    });
+
+    await s.link(common.mustNotCall());
+    assert.strictEqual(await s.evaluate(), undefined);
+  }
+
   for (const invalidName of [1, Symbol.iterator, {}, [], null, true, 0]) {
     const s = new SyntheticModule([], () => {});
     await s.link(() => {});
@@ -36,8 +47,6 @@ const assert = require('assert');
     });
   }
 
-  // https://bugs.chromium.org/p/v8/issues/detail?id=9828
-  /*
   {
     const s = new SyntheticModule([], () => {});
     await s.link(() => {});
@@ -47,7 +56,6 @@ const assert = require('assert');
       name: 'ReferenceError',
     });
   }
-  */
 
   {
     const s = new SyntheticModule([], () => {});
@@ -57,4 +65,14 @@ const assert = require('assert');
       code: 'ERR_VM_MODULE_STATUS',
     });
   }
-})();
+
+  {
+    assert.throws(() => {
+      SyntheticModule.prototype.setExport.call({}, 'foo');
+    }, {
+      code: 'ERR_VM_MODULE_NOT_MODULE',
+      message: /Provided module is not an instance of Module/
+    });
+  }
+
+})().then(common.mustCall());

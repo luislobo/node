@@ -14,20 +14,19 @@ server.on('stream', common.mustCall((stream, headers) => {
   const port = server.address().port;
 
   // Must receive a callback (function)
-  common.expectsError(
+  assert.throws(
     () => stream.pushStream({
       ':scheme': 'http',
       ':path': '/foobar',
       ':authority': `localhost:${port}`,
     }, {}, 'callback'),
     {
-      code: 'ERR_INVALID_CALLBACK',
-      message: "Callback must be a function. Received 'callback'"
+      code: 'ERR_INVALID_ARG_TYPE',
     }
   );
 
   // Must validate headers
-  common.expectsError(
+  assert.throws(
     () => stream.pushStream({ 'connection': 'test' }, {}, () => {}),
     {
       code: 'ERR_HTTP2_INVALID_CONNECTION_HEADERS',

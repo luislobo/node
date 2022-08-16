@@ -6,20 +6,17 @@ if (!common.hasCrypto)
 
 const assert = require('assert');
 const http2 = require('http2');
-const { inspect } = require('util');
 
 // Verify that setTimeout callback verifications work correctly
 const verifyCallbacks = (server) => {
   const testTimeout = 10;
 
   [true, 1, {}, [], null, 'test'].forEach((notFunction) => {
-    common.expectsError(
+    assert.throws(
       () => server.setTimeout(testTimeout, notFunction),
       {
-        type: TypeError,
-        code: 'ERR_INVALID_CALLBACK',
-        message: 'Callback must be a function. ' +
-                 `Received ${inspect(notFunction)}`
+        name: 'TypeError',
+        code: 'ERR_INVALID_ARG_TYPE',
       }
     );
   });

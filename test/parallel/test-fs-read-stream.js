@@ -31,11 +31,11 @@ const fixtures = require('../common/fixtures');
 const fn = fixtures.path('elipses.txt');
 const rangeFile = fixtures.path('x.txt');
 
-{
+function test1(options) {
   let paused = false;
   let bytesRead = 0;
 
-  const file = fs.createReadStream(fn);
+  const file = fs.createReadStream(fn, options);
   const fileSize = fs.statSync(fn).size;
 
   assert.strictEqual(file.bytesRead, 0);
@@ -88,8 +88,17 @@ const rangeFile = fixtures.path('x.txt');
   });
 }
 
+test1({});
+test1({
+  fs: {
+    open: common.mustCall(fs.open),
+    read: common.mustCallAtLeast(fs.read, 1),
+    close: common.mustCall(fs.close),
+  }
+});
+
 {
-  const file = fs.createReadStream(fn, { encoding: 'utf8' });
+  const file = fs.createReadStream(fn, common.mustNotMutateObjectDeep({ encoding: 'utf8' }));
   file.length = 0;
   file.on('data', function(data) {
     assert.strictEqual(typeof data, 'string');
@@ -110,7 +119,7 @@ const rangeFile = fixtures.path('x.txt');
 
 {
   const file =
-    fs.createReadStream(rangeFile, { bufferSize: 1, start: 1, end: 2 });
+    fs.createReadStream(rangeFile, common.mustNotMutateObjectDeep({ bufferSize: 1, start: 1, end: 2 }));
   let contentRead = '';
   file.on('data', function(data) {
     contentRead += data.toString('utf-8');
@@ -121,7 +130,7 @@ const rangeFile = fixtures.path('x.txt');
 }
 
 {
-  const file = fs.createReadStream(rangeFile, { bufferSize: 1, start: 1 });
+  const file = fs.createReadStream(rangeFile, common.mustNotMutateObjectDeep({ bufferSize: 1, start: 1 }));
   file.data = '';
   file.on('data', function(data) {
     file.data += data.toString('utf-8');
@@ -133,7 +142,7 @@ const rangeFile = fixtures.path('x.txt');
 
 {
   // Ref: https://github.com/nodejs/node-v0.x-archive/issues/2320
-  const file = fs.createReadStream(rangeFile, { bufferSize: 1.23, start: 1 });
+  const file = fs.createReadStream(rangeFile, common.mustNotMutateObjectDeep({ bufferSize: 1.23, start: 1 }));
   file.data = '';
   file.on('data', function(data) {
     file.data += data.toString('utf-8');
@@ -143,19 +152,19 @@ const rangeFile = fixtures.path('x.txt');
   }));
 }
 
-common.expectsError(
+assert.throws(
   () => {
-    fs.createReadStream(rangeFile, { start: 10, end: 2 });
+    fs.createReadStream(rangeFile, common.mustNotMutateObjectDeep({ start: 10, end: 2 }));
   },
   {
     code: 'ERR_OUT_OF_RANGE',
     message: 'The value of "start" is out of range. It must be <= "end"' +
              ' (here: 2). Received 10',
-    type: RangeError
+    name: 'RangeError'
   });
 
 {
-  const stream = fs.createReadStream(rangeFile, { start: 0, end: 0 });
+  const stream = fs.createReadStream(rangeFile, common.mustNotMutateObjectDeep({ start: 0, end: 0 }));
   stream.data = '';
 
   stream.on('data', function(chunk) {
@@ -169,7 +178,7 @@ common.expectsError(
 
 {
   // Verify that end works when start is not specified.
-  const stream = new fs.createReadStream(rangeFile, { end: 1 });
+  const stream = new fs.createReadStream(rangeFile, common.mustNotMutateObjectDeep({ end: 1 }));
   stream.data = '';
 
   stream.on('data', function(chunk) {
@@ -190,7 +199,7 @@ if (!common.isWindows) {
   const mkfifoResult = child_process.spawnSync('mkfifo', [filename]);
   if (!mkfifoResult.error) {
     child_process.exec(`echo "xyz foobar" > '${filename}'`);
-    const stream = new fs.createReadStream(filename, { end: 1 });
+    const stream = new fs.createReadStream(filename, common.mustNotMutateObjectDeep({ end: 1 }));
     stream.data = '';
 
     stream.on('data', function(chunk) {
@@ -214,7 +223,7 @@ if (!common.isWindows) {
 }
 
 {
-  let file = fs.createReadStream(rangeFile, { autoClose: false });
+  let file = fs.createReadStream(rangeFile, common.mustNotMutateObjectDeep({ autoClose: false }));
   let data = '';
   file.on('data', function(chunk) { data += chunk; });
   file.on('end', common.mustCall(function() {
@@ -228,7 +237,7 @@ if (!common.isWindows) {
 
   function fileNext() {
     // This will tell us if the fd is usable again or not.
-    file = fs.createReadStream(null, { fd: file.fd, start: 0 });
+    file = fs.createReadStream(null, common.mustNotMutateObjectDeep({ fd: file.fd, start: 0 }));
     file.data = '';
     file.on('data', function(data) {
       file.data += data;
@@ -245,7 +254,7 @@ if (!common.isWindows) {
 
 {
   // Just to make sure autoClose won't close the stream because of error.
-  const file = fs.createReadStream(null, { fd: 13337, autoClose: false });
+  const file = fs.createReadStream(null, common.mustNotMutateObjectDeep({ fd: 13337, autoClose: false }));
   file.on('data', common.mustNotCall());
   file.on('error', common.mustCall());
   process.on('exit', function() {
@@ -262,7 +271,7 @@ if (!common.isWindows) {
   file.on('error', common.mustCall());
 
   process.on('exit', function() {
-    assert(!file.closed);
+    assert(file.closed);
     assert(file.destroyed);
   });
 }

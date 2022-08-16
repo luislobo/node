@@ -4,7 +4,9 @@ const common = require('../common.js');
 let icu;
 try {
   icu = common.binding('icu');
-} catch {}
+} catch {
+  // Continue regardless of error.
+}
 const punycode = require('punycode');
 
 const bench = common.createBenchmark(main, {
@@ -45,26 +47,23 @@ function usingICU(val) {
 }
 
 function runPunycode(n, val) {
-  var i = 0;
-  for (; i < n; i++)
+  for (let i = 0; i < n; i++)
     usingPunycode(val);
   bench.start();
-  for (i = 0; i < n; i++)
+  for (let i = 0; i < n; i++)
     usingPunycode(val);
   bench.end(n);
 }
 
 function runICU(n, val) {
   bench.start();
-  for (var i = 0; i < n; i++)
+  for (let i = 0; i < n; i++)
     usingICU(val);
   bench.end(n);
 }
 
 function main({ n, val, method }) {
   switch (method) {
-    // '' is a default case for tests
-    case '':
     case 'punycode':
       runPunycode(n, val);
       break;

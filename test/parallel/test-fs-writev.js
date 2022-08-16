@@ -24,9 +24,7 @@ const getFileName = (i) => path.join(tmpdir.path, `writev_${i}.txt`);
   const buffer = Buffer.from(expected);
   const bufferArr = [buffer, buffer];
 
-  const done = common.mustCall((err, written, buffers) => {
-    assert.ifError(err);
-
+  const done = common.mustSucceed((written, buffers) => {
     assert.deepStrictEqual(bufferArr, buffers);
     const expectedLength = bufferArr.length * buffer.byteLength;
     assert.deepStrictEqual(written, expectedLength);
@@ -46,9 +44,7 @@ const getFileName = (i) => path.join(tmpdir.path, `writev_${i}.txt`);
   const buffer = Buffer.from(expected);
   const bufferArr = [buffer, buffer];
 
-  const done = common.mustCall((err, written, buffers) => {
-    assert.ifError(err);
-
+  const done = common.mustSucceed((written, buffers) => {
     assert.deepStrictEqual(bufferArr, buffers);
 
     const expectedLength = bufferArr.length * buffer.byteLength;
@@ -61,18 +57,37 @@ const getFileName = (i) => path.join(tmpdir.path, `writev_${i}.txt`);
   fs.writev(fd, bufferArr, done);
 }
 
+
+// fs.writev with empty array of buffers
+{
+  const filename = getFileName(3);
+  const fd = fs.openSync(filename, 'w');
+  const bufferArr = [];
+  let afterSyncCall = false;
+
+  const done = common.mustSucceed((written, buffers) => {
+    assert.strictEqual(buffers.length, 0);
+    assert.strictEqual(written, 0);
+    assert(afterSyncCall);
+    fs.closeSync(fd);
+  });
+
+  fs.writev(fd, bufferArr, done);
+  afterSyncCall = true;
+}
+
 /**
  * Testing with wrong input types
  */
 {
-  const filename = getFileName(3);
+  const filename = getFileName(4);
   const fd = fs.openSync(filename, 'w');
 
   [false, 'test', {}, [{}], ['sdf'], null, undefined].forEach((i) => {
-    common.expectsError(
+    assert.throws(
       () => fs.writev(fd, i, null, common.mustNotCall()), {
         code: 'ERR_INVALID_ARG_TYPE',
-        type: TypeError
+        name: 'TypeError'
       }
     );
   });
@@ -82,11 +97,11 @@ const getFileName = (i) => path.join(tmpdir.path, `writev_${i}.txt`);
 
 // fs.writev with wrong fd types
 [false, 'test', {}, [{}], null, undefined].forEach((i) => {
-  common.expectsError(
+  assert.throws(
     () => fs.writev(i, common.mustNotCall()),
     {
       code: 'ERR_INVALID_ARG_TYPE',
-      type: TypeError
+      name: 'TypeError'
     }
   );
 });

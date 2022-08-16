@@ -17,8 +17,8 @@ assert.throws(
   {
     code: 'ERR_INVALID_ARG_TYPE',
     name: 'TypeError',
-    message: 'The "groups" argument must be of type Array. ' +
-             'Received type undefined'
+    message: 'The "groups" argument must be an instance of Array. ' +
+             'Received undefined'
   }
 );
 
@@ -29,8 +29,6 @@ assert.throws(
   {
     code: 'ERR_OUT_OF_RANGE',
     name: 'RangeError',
-    message: 'The value of "groups[1]" is out of range. ' +
-              'It must be >= 0 && < 4294967296. Received -1'
   }
 );
 
@@ -43,8 +41,8 @@ assert.throws(
       code: 'ERR_INVALID_ARG_TYPE',
       name: 'TypeError',
       message: 'The "groups[0]" argument must be ' +
-               'one of type number or string. ' +
-               `Received type ${typeof val}`
+               'one of type number or string.' +
+               common.invalidArgTypeHelper(val)
     }
   );
 });

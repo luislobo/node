@@ -45,7 +45,14 @@ typedef struct pollfd {
 #endif
 
 #include <mswsock.h>
+// Disable the typedef in mstcpip.h of MinGW.
+#define _TCP_INITIAL_RTO_PARAMETERS _TCP_INITIAL_RTO_PARAMETERS__AVOID
+#define TCP_INITIAL_RTO_PARAMETERS TCP_INITIAL_RTO_PARAMETERS__AVOID
+#define PTCP_INITIAL_RTO_PARAMETERS PTCP_INITIAL_RTO_PARAMETERS__AVOID
 #include <ws2tcpip.h>
+#undef _TCP_INITIAL_RTO_PARAMETERS
+#undef TCP_INITIAL_RTO_PARAMETERS
+#undef PTCP_INITIAL_RTO_PARAMETERS
 #include <windows.h>
 
 #include <process.h>
@@ -517,7 +524,7 @@ typedef struct {
       /* eol conversion state */                                              \
       unsigned char previous_eol;                                             \
       /* ansi parser state */                                                 \
-      unsigned char ansi_parser_state;                                        \
+      unsigned short ansi_parser_state;                                       \
       unsigned char ansi_csi_argc;                                            \
       unsigned short ansi_csi_argv[4];                                        \
       COORD saved_position;                                                   \

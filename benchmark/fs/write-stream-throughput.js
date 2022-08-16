@@ -17,9 +17,9 @@ const bench = common.createBenchmark(main, {
 });
 
 function main({ dur, encodingType, size }) {
-  var encoding;
+  let encoding;
 
-  var chunk;
+  let chunk;
   switch (encodingType) {
     case 'buf':
       chunk = Buffer.alloc(size, 'b');
@@ -36,10 +36,14 @@ function main({ dur, encodingType, size }) {
       throw new Error(`invalid encodingType: ${encodingType}`);
   }
 
-  try { fs.unlinkSync(filename); } catch {}
+  try {
+    fs.unlinkSync(filename);
+  } catch {
+    // Continue regardless of error.
+  }
 
-  var started = false;
-  var ended = false;
+  let started = false;
+  let ended = false;
 
   const f = fs.createWriteStream(filename);
   f.on('drain', write);
@@ -48,7 +52,11 @@ function main({ dur, encodingType, size }) {
   f.on('finish', () => {
     ended = true;
     const written = fs.statSync(filename).size / 1024;
-    try { fs.unlinkSync(filename); } catch {}
+    try {
+      fs.unlinkSync(filename);
+    } catch {
+      // Continue regardless of error.
+    }
     bench.end(written / 1024);
   });
 

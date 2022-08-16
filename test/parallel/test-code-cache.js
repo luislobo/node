@@ -12,27 +12,33 @@ const {
 } = require('internal/test/binding');
 const {
   getCacheUsage,
-  moduleCategories: { canBeRequired, cannotBeRequired }
-} = internalBinding('native_module');
+  builtinCategories: { canBeRequired }
+} = internalBinding('builtins');
 
 for (const key of canBeRequired) {
-  require(key);
+  require(`node:${key}`);
 }
 
 // The computation has to be delayed until we have done loading modules
 const {
   compiledWithoutCache,
-  compiledWithCache
+  compiledWithCache,
+  compiledInSnapshot
 } = getCacheUsage();
 
-const loadedModules = process.moduleLoadList
-  .filter((m) => m.startsWith('NativeModule'))
+function extractModules(list) {
+  return list.filter((m) => m.startsWith('NativeModule'))
   .map((m) => m.replace('NativeModule ', ''));
+}
+
+const loadedModules = extractModules(process.moduleLoadList);
 
 // Cross-compiled binaries do not have code cache, verifies that the builtins
 // are all compiled without cache and we are doing the bookkeeping right.
 if (!process.features.cached_builtins) {
-  console.log('The binary is not configured with code cache');
+  assert(!process.config.variables.node_use_node_code_cache ||
+         process.execArgv.includes('--no-node-snapshot'));
+
   if (isMainThread) {
     assert.deepStrictEqual(compiledWithCache, new Set());
     for (const key of loadedModules) {
@@ -46,24 +52,15 @@ if (!process.features.cached_builtins) {
     assert.notDeepStrictEqual(compiledWithCache, new Set());
   }
 } else {  // Native compiled
-  assert.strictEqual(
-    process.config.variables.node_code_cache,
-    'yes'
-  );
-
-  if (!isMainThread) {
-    for (const key of [ 'internal/bootstrap/pre_execution' ]) {
-      canBeRequired.add(key);
-      cannotBeRequired.delete(key);
-    }
-  }
+  assert(process.config.variables.node_use_node_code_cache);
 
   const wrong = [];
   for (const key of loadedModules) {
-    if (cannotBeRequired.has(key) && !compiledWithoutCache.has(key)) {
-      wrong.push(`"${key}" should've been compiled **without** code cache`);
+    if (key.startsWith('internal/deps/v8/tools')) {
+      continue;
     }
-    if (canBeRequired.has(key) && !compiledWithCache.has(key)) {
+    if (!compiledWithCache.has(key) &&
+      compiledInSnapshot.indexOf(key) === -1) {
       wrong.push(`"${key}" should've been compiled **with** code cache`);
     }
   }

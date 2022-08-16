@@ -4,11 +4,12 @@
 #if defined(NODE_WANT_INTERNALS) && NODE_WANT_INTERNALS
 
 #include "async_wrap.h"
-#include "env.h"
 #include "util.h"
 #include "v8.h"
 
 namespace node {
+
+class Environment;
 
 class ReqWrapBase {
  public:
@@ -49,9 +50,10 @@ class ReqWrap : public AsyncWrap, public ReqWrapBase {
 
  private:
   friend int GenDebugSymbols();
-  template <typename ReqT, typename U>
-  friend struct MakeLibuvRequestCallback;
 
+  // Adding `friend struct MakeLibuvRequestCallback` is not enough anymore
+  // for some reason. Consider this private.
+ public:
   typedef void (*callback_t)();
   callback_t original_callback_ = nullptr;
 
@@ -64,7 +66,7 @@ class ReqWrap : public AsyncWrap, public ReqWrapBase {
   // members in memory are predictable. sizeof(req_) depends on the type of T,
   // so req_wrap_queue_ would no longer be at a fixed offset if it came after
   // req_. For more information please refer to
-  // `doc/guides/node-postmortem-support.md`
+  // `doc/contributing/node-postmortem-support.md`
   T req_;
 };
 

@@ -39,6 +39,7 @@
 
 #include "src/codegen/ia32/assembler-ia32.h"
 
+#include "src/base/memory.h"
 #include "src/codegen/assembler.h"
 #include "src/debug/debug.h"
 #include "src/objects/objects-inl.h"
@@ -48,8 +49,6 @@ namespace internal {
 
 bool CpuFeatures::SupportsOptimizer() { return true; }
 
-bool CpuFeatures::SupportsWasmSimd128() { return IsSupported(SSE4_1); }
-
 // The modes possibly affected by apply must be in kApplyMask.
 void RelocInfo::apply(intptr_t delta) {
   DCHECK_EQ(kApplyMask, (RelocInfo::ModeMask(RelocInfo::CODE_TARGET) |
@@ -58,12 +57,12 @@ void RelocInfo::apply(intptr_t delta) {
                          RelocInfo::ModeMask(RelocInfo::RUNTIME_ENTRY)));
   if (IsRuntimeEntry(rmode_) || IsCodeTarget(rmode_) ||
       IsOffHeapTarget(rmode_)) {
-    int32_t* p = reinterpret_cast<int32_t*>(pc_);
-    *p -= delta;  // Relocate entry.
+    base::WriteUnalignedValue(pc_,
+                              base::ReadUnalignedValue<int32_t>(pc_) - delta);
   } else if (IsInternalReference(rmode_)) {
-    // absolute code pointer inside code object moves with the code object.
-    int32_t* p = reinterpret_cast<int32_t*>(pc_);
-    *p += delta;  // Relocate entry.
+    // Absolute code pointer inside code object moves with the code object.
+    base::WriteUnalignedValue(pc_,
+                              base::ReadUnalignedValue<int32_t>(pc_) + delta);
   }
 }
 
@@ -81,29 +80,29 @@ Address RelocInfo::constant_pool_entry_address() { UNREACHABLE(); }
 
 int RelocInfo::target_address_size() { return Assembler::kSpecialTargetSize; }
 
-HeapObject RelocInfo::target_object() {
-  DCHECK(IsCodeTarget(rmode_) || rmode_ == FULL_EMBEDDED_OBJECT);
+HeapObject RelocInfo::target_object(PtrComprCageBase cage_base) {
+  DCHECK(IsCodeTarget(rmode_) || IsFullEmbeddedObject(rmode_) ||
+         IsDataEmbeddedObject(rmode_));
   return HeapObject::cast(Object(ReadUnalignedValue<Address>(pc_)));
 }
 
-HeapObject RelocInfo::target_object_no_host(Isolate* isolate) {
-  return target_object();
-}
-
 Handle<HeapObject> RelocInfo::target_object_handle(Assembler* origin) {
-  DCHECK(IsCodeTarget(rmode_) || rmode_ == FULL_EMBEDDED_OBJECT);
+  DCHECK(IsCodeTarget(rmode_) || IsFullEmbeddedObject(rmode_) ||
+         IsDataEmbeddedObject(rmode_));
   return Handle<HeapObject>::cast(ReadUnalignedValue<Handle<Object>>(pc_));
 }
 
 void RelocInfo::set_target_object(Heap* heap, HeapObject target,
                                   WriteBarrierMode write_barrier_mode,
                                   ICacheFlushMode icache_flush_mode) {
-  DCHECK(IsCodeTarget(rmode_) || rmode_ == FULL_EMBEDDED_OBJECT);
+  DCHECK(IsCodeTarget(rmode_) || IsFullEmbeddedObject(rmode_) ||
+         IsDataEmbeddedObject(rmode_));
   WriteUnalignedValue(pc_, target.ptr());
   if (icache_flush_mode != SKIP_ICACHE_FLUSH) {
     FlushInstructionCache(pc_, sizeof(Address));
   }
-  if (write_barrier_mode == UPDATE_WRITE_BARRIER && !host().is_null()) {
+  if (write_barrier_mode == UPDATE_WRITE_BARRIER && !host().is_null() &&
+      !FLAG_disable_write_barriers) {
     WriteBarrierForCode(host(), this, target);
   }
 }
@@ -180,7 +179,7 @@ void Assembler::emit(Handle<HeapObject> handle) {
 }
 
 void Assembler::emit(uint32_t x, RelocInfo::Mode rmode) {
-  if (!RelocInfo::IsNone(rmode)) {
+  if (!RelocInfo::IsNoInfo(rmode)) {
     RecordRelocInfo(rmode);
   }
   emit(x);
@@ -196,13 +195,13 @@ void Assembler::emit(const Immediate& x) {
     emit_code_relative_offset(label);
     return;
   }
-  if (!RelocInfo::IsNone(x.rmode_)) RecordRelocInfo(x.rmode_);
+  if (!RelocInfo::IsNoInfo(x.rmode_)) RecordRelocInfo(x.rmode_);
   if (x.is_heap_object_request()) {
     RequestHeapObject(x.heap_object_request());
     emit(0);
-  } else {
-    emit(x.immediate());
+    return;
   }
+  emit(x.immediate());
 }
 
 void Assembler::emit_code_relative_offset(Label* label) {
@@ -222,7 +221,7 @@ void Assembler::emit_b(Immediate x) {
 }
 
 void Assembler::emit_w(const Immediate& x) {
-  DCHECK(RelocInfo::IsNone(x.rmode_));
+  DCHECK(RelocInfo::IsNoInfo(x.rmode_));
   uint16_t value = static_cast<uint16_t>(x.immediate());
   WriteUnalignedValue(reinterpret_cast<Address>(pc_), value);
   pc_ += sizeof(uint16_t);

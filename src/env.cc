@@ -1,17 +1,19 @@
 #include "env.h"
-
 #include "async_wrap.h"
+#include "base_object-inl.h"
+#include "debug_utils-inl.h"
+#include "diagnosticfilename-inl.h"
 #include "memory_tracker-inl.h"
 #include "node_buffer.h"
 #include "node_context_data.h"
 #include "node_errors.h"
-#include "node_file.h"
 #include "node_internals.h"
-#include "node_native_module.h"
 #include "node_options-inl.h"
-#include "node_process.h"
+#include "node_process-inl.h"
 #include "node_v8_platform-inl.h"
 #include "node_worker.h"
+#include "req_wrap-inl.h"
+#include "stream_base.h"
 #include "tracing/agent.h"
 #include "tracing/traced_value.h"
 #include "util-inl.h"
@@ -19,54 +21,276 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cinttypes>
 #include <cstdio>
+#include <iostream>
+#include <limits>
 #include <memory>
 
 namespace node {
 
 using errors::TryCatchScope;
-using v8::ArrayBuffer;
+using v8::Array;
 using v8::Boolean;
 using v8::Context;
 using v8::EmbedderGraph;
-using v8::FinalizationGroup;
+using v8::EscapableHandleScope;
 using v8::Function;
+using v8::FunctionCallbackInfo;
 using v8::FunctionTemplate;
 using v8::HandleScope;
+using v8::HeapSpaceStatistics;
 using v8::Integer;
 using v8::Isolate;
 using v8::Local;
+using v8::MaybeLocal;
 using v8::NewStringType;
 using v8::Number;
 using v8::Object;
 using v8::Private;
+using v8::Script;
 using v8::SnapshotCreator;
 using v8::StackTrace;
 using v8::String;
 using v8::Symbol;
 using v8::TracingController;
+using v8::TryCatch;
 using v8::Undefined;
 using v8::Value;
+using v8::WeakCallbackInfo;
+using v8::WeakCallbackType;
 using worker::Worker;
 
 int const Environment::kNodeContextTag = 0x6e6f64;
 void* const Environment::kNodeContextTagPtr = const_cast<void*>(
     static_cast<const void*>(&Environment::kNodeContextTag));
 
-std::vector<size_t> IsolateData::Serialize(SnapshotCreator* creator) {
+void AsyncHooks::SetJSPromiseHooks(Local<Function> init,
+                                   Local<Function> before,
+                                   Local<Function> after,
+                                   Local<Function> resolve) {
+  js_promise_hooks_[0].Reset(env()->isolate(), init);
+  js_promise_hooks_[1].Reset(env()->isolate(), before);
+  js_promise_hooks_[2].Reset(env()->isolate(), after);
+  js_promise_hooks_[3].Reset(env()->isolate(), resolve);
+  for (auto it = contexts_.begin(); it != contexts_.end(); it++) {
+    if (it->IsEmpty()) {
+      contexts_.erase(it--);
+      continue;
+    }
+    PersistentToLocal::Weak(env()->isolate(), *it)
+        ->SetPromiseHooks(init, before, after, resolve);
+  }
+}
+
+// Remember to keep this code aligned with pushAsyncContext() in JS.
+void AsyncHooks::push_async_context(double async_id,
+                                    double trigger_async_id,
+                                    Local<Object> resource) {
+  // Since async_hooks is experimental, do only perform the check
+  // when async_hooks is enabled.
+  if (fields_[kCheck] > 0) {
+    CHECK_GE(async_id, -1);
+    CHECK_GE(trigger_async_id, -1);
+  }
+
+  uint32_t offset = fields_[kStackLength];
+  if (offset * 2 >= async_ids_stack_.Length()) grow_async_ids_stack();
+  async_ids_stack_[2 * offset] = async_id_fields_[kExecutionAsyncId];
+  async_ids_stack_[2 * offset + 1] = async_id_fields_[kTriggerAsyncId];
+  fields_[kStackLength] += 1;
+  async_id_fields_[kExecutionAsyncId] = async_id;
+  async_id_fields_[kTriggerAsyncId] = trigger_async_id;
+
+#ifdef DEBUG
+  for (uint32_t i = offset; i < native_execution_async_resources_.size(); i++)
+    CHECK(native_execution_async_resources_[i].IsEmpty());
+#endif
+
+  // When this call comes from JS (as a way of increasing the stack size),
+  // `resource` will be empty, because JS caches these values anyway.
+  if (!resource.IsEmpty()) {
+    native_execution_async_resources_.resize(offset + 1);
+    // Caveat: This is a v8::Local<> assignment, we do not keep a v8::Global<>!
+    native_execution_async_resources_[offset] = resource;
+  }
+}
+
+// Remember to keep this code aligned with popAsyncContext() in JS.
+bool AsyncHooks::pop_async_context(double async_id) {
+  // In case of an exception then this may have already been reset, if the
+  // stack was multiple MakeCallback()'s deep.
+  if (UNLIKELY(fields_[kStackLength] == 0)) return false;
+
+  // Ask for the async_id to be restored as a check that the stack
+  // hasn't been corrupted.
+  if (UNLIKELY(fields_[kCheck] > 0 &&
+               async_id_fields_[kExecutionAsyncId] != async_id)) {
+    FailWithCorruptedAsyncStack(async_id);
+  }
+
+  uint32_t offset = fields_[kStackLength] - 1;
+  async_id_fields_[kExecutionAsyncId] = async_ids_stack_[2 * offset];
+  async_id_fields_[kTriggerAsyncId] = async_ids_stack_[2 * offset + 1];
+  fields_[kStackLength] = offset;
+
+  if (LIKELY(offset < native_execution_async_resources_.size() &&
+             !native_execution_async_resources_[offset].IsEmpty())) {
+#ifdef DEBUG
+    for (uint32_t i = offset + 1; i < native_execution_async_resources_.size();
+         i++) {
+      CHECK(native_execution_async_resources_[i].IsEmpty());
+    }
+#endif
+    native_execution_async_resources_.resize(offset);
+    if (native_execution_async_resources_.size() <
+            native_execution_async_resources_.capacity() / 2 &&
+        native_execution_async_resources_.size() > 16) {
+      native_execution_async_resources_.shrink_to_fit();
+    }
+  }
+
+  if (UNLIKELY(js_execution_async_resources()->Length() > offset)) {
+    HandleScope handle_scope(env()->isolate());
+    USE(js_execution_async_resources()->Set(
+        env()->context(),
+        env()->length_string(),
+        Integer::NewFromUnsigned(env()->isolate(), offset)));
+  }
+
+  return fields_[kStackLength] > 0;
+}
+
+void AsyncHooks::clear_async_id_stack() {
+  Isolate* isolate = env()->isolate();
+  HandleScope handle_scope(isolate);
+  if (!js_execution_async_resources_.IsEmpty()) {
+    USE(PersistentToLocal::Strong(js_execution_async_resources_)
+            ->Set(env()->context(),
+                  env()->length_string(),
+                  Integer::NewFromUnsigned(isolate, 0)));
+  }
+  native_execution_async_resources_.clear();
+  native_execution_async_resources_.shrink_to_fit();
+
+  async_id_fields_[kExecutionAsyncId] = 0;
+  async_id_fields_[kTriggerAsyncId] = 0;
+  fields_[kStackLength] = 0;
+}
+
+void AsyncHooks::AddContext(Local<Context> ctx) {
+  ctx->SetPromiseHooks(js_promise_hooks_[0].IsEmpty()
+                           ? Local<Function>()
+                           : PersistentToLocal::Strong(js_promise_hooks_[0]),
+                       js_promise_hooks_[1].IsEmpty()
+                           ? Local<Function>()
+                           : PersistentToLocal::Strong(js_promise_hooks_[1]),
+                       js_promise_hooks_[2].IsEmpty()
+                           ? Local<Function>()
+                           : PersistentToLocal::Strong(js_promise_hooks_[2]),
+                       js_promise_hooks_[3].IsEmpty()
+                           ? Local<Function>()
+                           : PersistentToLocal::Strong(js_promise_hooks_[3]));
+
+  size_t id = contexts_.size();
+  contexts_.resize(id + 1);
+  contexts_[id].Reset(env()->isolate(), ctx);
+  contexts_[id].SetWeak();
+}
+
+void AsyncHooks::RemoveContext(Local<Context> ctx) {
+  Isolate* isolate = env()->isolate();
+  HandleScope handle_scope(isolate);
+  contexts_.erase(std::remove_if(contexts_.begin(),
+                                 contexts_.end(),
+                                 [&](auto&& el) { return el.IsEmpty(); }),
+                  contexts_.end());
+  for (auto it = contexts_.begin(); it != contexts_.end(); it++) {
+    Local<Context> saved_context = PersistentToLocal::Weak(isolate, *it);
+    if (saved_context == ctx) {
+      it->Reset();
+      contexts_.erase(it);
+      break;
+    }
+  }
+}
+
+AsyncHooks::DefaultTriggerAsyncIdScope::DefaultTriggerAsyncIdScope(
+    Environment* env, double default_trigger_async_id)
+    : async_hooks_(env->async_hooks()) {
+  if (env->async_hooks()->fields()[AsyncHooks::kCheck] > 0) {
+    CHECK_GE(default_trigger_async_id, 0);
+  }
+
+  old_default_trigger_async_id_ =
+      async_hooks_->async_id_fields()[AsyncHooks::kDefaultTriggerAsyncId];
+  async_hooks_->async_id_fields()[AsyncHooks::kDefaultTriggerAsyncId] =
+      default_trigger_async_id;
+}
+
+AsyncHooks::DefaultTriggerAsyncIdScope::~DefaultTriggerAsyncIdScope() {
+  async_hooks_->async_id_fields()[AsyncHooks::kDefaultTriggerAsyncId] =
+      old_default_trigger_async_id_;
+}
+
+AsyncHooks::DefaultTriggerAsyncIdScope::DefaultTriggerAsyncIdScope(
+    AsyncWrap* async_wrap)
+    : DefaultTriggerAsyncIdScope(async_wrap->env(),
+                                 async_wrap->get_async_id()) {}
+
+std::ostream& operator<<(std::ostream& output,
+                         const std::vector<SnapshotIndex>& v) {
+  output << "{ ";
+  for (const SnapshotIndex i : v) {
+    output << i << ", ";
+  }
+  output << " }";
+  return output;
+}
+
+std::ostream& operator<<(std::ostream& output,
+                         const IsolateDataSerializeInfo& i) {
+  output << "{\n"
+         << "// -- primitive begins --\n"
+         << i.primitive_values << ",\n"
+         << "// -- primitive ends --\n"
+         << "// -- template_values begins --\n"
+         << i.template_values << ",\n"
+         << "// -- template_values ends --\n"
+         << "}";
+  return output;
+}
+
+std::ostream& operator<<(std::ostream& output, const SnapshotMetadata& i) {
+  output << "{\n"
+         << "  "
+         << (i.type == SnapshotMetadata::Type::kDefault
+                 ? "SnapshotMetadata::Type::kDefault"
+                 : "SnapshotMetadata::Type::kFullyCustomized")
+         << ", // type\n"
+         << "  \"" << i.node_version << "\", // node_version\n"
+         << "  \"" << i.node_arch << "\", // node_arch\n"
+         << "  \"" << i.node_platform << "\", // node_platform\n"
+         << "  " << i.v8_cache_version_tag << ", // v8_cache_version_tag\n"
+         << "}";
+  return output;
+}
+
+IsolateDataSerializeInfo IsolateData::Serialize(SnapshotCreator* creator) {
   Isolate* isolate = creator->GetIsolate();
-  std::vector<size_t> indexes;
+  IsolateDataSerializeInfo info;
   HandleScope handle_scope(isolate);
   // XXX(joyeecheung): technically speaking, the indexes here should be
   // consecutive and we could just return a range instead of an array,
   // but that's not part of the V8 API contract so we use an array
   // just to be safe.
 
-#define VP(PropertyName, StringValue) V(v8::Private, PropertyName)
-#define VY(PropertyName, StringValue) V(v8::Symbol, PropertyName)
-#define VS(PropertyName, StringValue) V(v8::String, PropertyName)
+#define VP(PropertyName, StringValue) V(Private, PropertyName)
+#define VY(PropertyName, StringValue) V(Symbol, PropertyName)
+#define VS(PropertyName, StringValue) V(String, PropertyName)
 #define V(TypeName, PropertyName)                                              \
-  indexes.push_back(creator->AddData(PropertyName##_.Get(isolate)));
+  info.primitive_values.push_back(                                             \
+      creator->AddData(PropertyName##_.Get(isolate)));
   PER_ISOLATE_PRIVATE_SYMBOL_PROPERTIES(VP)
   PER_ISOLATE_SYMBOL_PROPERTIES(VY)
   PER_ISOLATE_STRING_PROPERTIES(VS)
@@ -75,24 +299,42 @@ std::vector<size_t> IsolateData::Serialize(SnapshotCreator* creator) {
 #undef VS
 #undef VP
 
-  return indexes;
+  for (size_t i = 0; i < AsyncWrap::PROVIDERS_LENGTH; i++)
+    info.primitive_values.push_back(creator->AddData(async_wrap_provider(i)));
+
+  uint32_t id = 0;
+#define V(PropertyName, TypeName)                                              \
+  do {                                                                         \
+    Local<TypeName> field = PropertyName();                                    \
+    if (!field.IsEmpty()) {                                                    \
+      size_t index = creator->AddData(field);                                  \
+      info.template_values.push_back({#PropertyName, id, index});              \
+    }                                                                          \
+    id++;                                                                      \
+  } while (0);
+  PER_ISOLATE_TEMPLATE_PROPERTIES(V)
+#undef V
+
+  return info;
 }
 
-void IsolateData::DeserializeProperties(const std::vector<size_t>* indexes) {
+void IsolateData::DeserializeProperties(const IsolateDataSerializeInfo* info) {
   size_t i = 0;
   HandleScope handle_scope(isolate_);
 
-#define VP(PropertyName, StringValue) V(v8::Private, PropertyName)
-#define VY(PropertyName, StringValue) V(v8::Symbol, PropertyName)
-#define VS(PropertyName, StringValue) V(v8::String, PropertyName)
+#define VP(PropertyName, StringValue) V(Private, PropertyName)
+#define VY(PropertyName, StringValue) V(Symbol, PropertyName)
+#define VS(PropertyName, StringValue) V(String, PropertyName)
 #define V(TypeName, PropertyName)                                              \
   do {                                                                         \
-    MaybeLocal<TypeName> field =                                               \
-        isolate_->GetDataFromSnapshotOnce<TypeName>((*indexes)[i++]);          \
-    if (field.IsEmpty()) {                                                     \
+    MaybeLocal<TypeName> maybe_field =                                         \
+        isolate_->GetDataFromSnapshotOnce<TypeName>(                           \
+            info->primitive_values[i++]);                                      \
+    Local<TypeName> field;                                                     \
+    if (!maybe_field.ToLocal(&field)) {                                        \
       fprintf(stderr, "Failed to deserialize " #PropertyName "\n");            \
     }                                                                          \
-    PropertyName##_.Set(isolate_, field.ToLocalChecked());                     \
+    PropertyName##_.Set(isolate_, field);                                      \
   } while (0);
   PER_ISOLATE_PRIVATE_SYMBOL_PROPERTIES(VP)
   PER_ISOLATE_SYMBOL_PROPERTIES(VY)
@@ -101,6 +343,41 @@ void IsolateData::DeserializeProperties(const std::vector<size_t>* indexes) {
 #undef VY
 #undef VS
 #undef VP
+
+  for (size_t j = 0; j < AsyncWrap::PROVIDERS_LENGTH; j++) {
+    MaybeLocal<String> maybe_field =
+        isolate_->GetDataFromSnapshotOnce<String>(info->primitive_values[i++]);
+    Local<String> field;
+    if (!maybe_field.ToLocal(&field)) {
+      fprintf(stderr, "Failed to deserialize AsyncWrap provider %zu\n", j);
+    }
+    async_wrap_providers_[j].Set(isolate_, field);
+  }
+
+  const std::vector<PropInfo>& values = info->template_values;
+  i = 0;  // index to the array
+  uint32_t id = 0;
+#define V(PropertyName, TypeName)                                              \
+  do {                                                                         \
+    if (values.size() > i && id == values[i].id) {                             \
+      const PropInfo& d = values[i];                                           \
+      DCHECK_EQ(d.name, #PropertyName);                                        \
+      MaybeLocal<TypeName> maybe_field =                                       \
+          isolate_->GetDataFromSnapshotOnce<TypeName>(d.index);                \
+      Local<TypeName> field;                                                   \
+      if (!maybe_field.ToLocal(&field)) {                                      \
+        fprintf(stderr,                                                        \
+                "Failed to deserialize isolate data template " #PropertyName   \
+                "\n");                                                         \
+      }                                                                        \
+      set_##PropertyName(field);                                               \
+      i++;                                                                     \
+    }                                                                          \
+    id++;                                                                      \
+  } while (0);
+
+  PER_ISOLATE_TEMPLATE_PROPERTIES(V);
+#undef V
 }
 
 void IsolateData::CreateProperties() {
@@ -151,61 +428,65 @@ void IsolateData::CreateProperties() {
           .ToLocalChecked());
   PER_ISOLATE_STRING_PROPERTIES(V)
 #undef V
+
+  // Create all the provider strings that will be passed to JS. Place them in
+  // an array so the array index matches the PROVIDER id offset. This way the
+  // strings can be retrieved quickly.
+#define V(Provider)                                                           \
+  async_wrap_providers_[AsyncWrap::PROVIDER_ ## Provider].Set(                \
+      isolate_,                                                               \
+      String::NewFromOneByte(                                                 \
+        isolate_,                                                             \
+        reinterpret_cast<const uint8_t*>(#Provider),                          \
+        NewStringType::kInternalized,                                         \
+        sizeof(#Provider) - 1).ToLocalChecked());
+  NODE_ASYNC_PROVIDER_TYPES(V)
+#undef V
+
+  // TODO(legendecas): eagerly create per isolate templates.
 }
 
 IsolateData::IsolateData(Isolate* isolate,
                          uv_loop_t* event_loop,
                          MultiIsolatePlatform* platform,
                          ArrayBufferAllocator* node_allocator,
-                         const std::vector<size_t>* indexes)
+                         const IsolateDataSerializeInfo* isolate_data_info)
     : isolate_(isolate),
       event_loop_(event_loop),
-      allocator_(isolate->GetArrayBufferAllocator()),
       node_allocator_(node_allocator == nullptr ? nullptr
                                                 : node_allocator->GetImpl()),
-      uses_node_allocator_(allocator_ == node_allocator_),
       platform_(platform) {
-  CHECK_NOT_NULL(allocator_);
-
   options_.reset(
       new PerIsolateOptions(*(per_process::cli_options->per_isolate)));
 
-  if (indexes == nullptr) {
+  if (isolate_data_info == nullptr) {
     CreateProperties();
   } else {
-    DeserializeProperties(indexes);
+    DeserializeProperties(isolate_data_info);
   }
 }
 
 void IsolateData::MemoryInfo(MemoryTracker* tracker) const {
 #define V(PropertyName, StringValue)                                           \
-  tracker->TrackField(#PropertyName, PropertyName(isolate()));
+  tracker->TrackField(#PropertyName, PropertyName());
   PER_ISOLATE_SYMBOL_PROPERTIES(V)
-#undef V
 
-#define V(PropertyName, StringValue)                                           \
-  tracker->TrackField(#PropertyName, PropertyName(isolate()));
   PER_ISOLATE_STRING_PROPERTIES(V)
 #undef V
+
+  tracker->TrackField("async_wrap_providers", async_wrap_providers_);
 
   if (node_allocator_ != nullptr) {
     tracker->TrackFieldWithSize(
         "node_allocator", sizeof(*node_allocator_), "NodeArrayBufferAllocator");
-  } else {
-    tracker->TrackFieldWithSize(
-        "allocator", sizeof(*allocator_), "v8::ArrayBuffer::Allocator");
   }
   tracker->TrackFieldWithSize(
       "platform", sizeof(*platform_), "MultiIsolatePlatform");
   // TODO(joyeecheung): implement MemoryRetainer in the option classes.
 }
 
-void InitThreadLocalOnce() {
-  CHECK_EQ(0, uv_key_create(&Environment::thread_local_env));
-}
-
 void TrackingTraceStateObserver::UpdateTraceCategoryState() {
-  if (!env_->owns_process_state()) {
+  if (!env_->owns_process_state() || !env_->can_call_into_js()) {
     // Ideally, we’d have a consistent story that treats all threads/Environment
     // instances equally here. However, tracing is essentially global, and this
     // callback is called from whichever thread calls `StartTracing()` or
@@ -226,28 +507,96 @@ void TrackingTraceStateObserver::UpdateTraceCategoryState() {
   TryCatchScope try_catch(env_);
   try_catch.SetVerbose(true);
   Local<Value> args[] = {Boolean::New(isolate, async_hooks_enabled)};
-  cb->Call(env_->context(), Undefined(isolate), arraysize(args), args)
-      .ToLocalChecked();
+  USE(cb->Call(env_->context(), Undefined(isolate), arraysize(args), args));
 }
 
-static std::atomic<uint64_t> next_thread_id{0};
+void Environment::AssignToContext(Local<v8::Context> context,
+                                  const ContextInfo& info) {
+  context->SetAlignedPointerInEmbedderData(ContextEmbedderIndex::kEnvironment,
+                                           this);
+  // Used by Environment::GetCurrent to know that we are on a node context.
+  context->SetAlignedPointerInEmbedderData(ContextEmbedderIndex::kContextTag,
+                                           Environment::kNodeContextTagPtr);
+  // Used to retrieve bindings
+  context->SetAlignedPointerInEmbedderData(
+      ContextEmbedderIndex::kBindingListIndex, &(this->bindings_));
 
-uint64_t Environment::AllocateThreadId() {
-  return next_thread_id++;
+#if HAVE_INSPECTOR
+  inspector_agent()->ContextCreated(context, info);
+#endif  // HAVE_INSPECTOR
+
+  this->async_hooks()->AddContext(context);
+}
+
+void Environment::TryLoadAddon(
+    const char* filename,
+    int flags,
+    const std::function<bool(binding::DLib*)>& was_loaded) {
+  loaded_addons_.emplace_back(filename, flags);
+  if (!was_loaded(&loaded_addons_.back())) {
+    loaded_addons_.pop_back();
+  }
+}
+
+std::string Environment::GetCwd() {
+  char cwd[PATH_MAX_BYTES];
+  size_t size = PATH_MAX_BYTES;
+  const int err = uv_cwd(cwd, &size);
+
+  if (err == 0) {
+    CHECK_GT(size, 0);
+    return cwd;
+  }
+
+  // This can fail if the cwd is deleted. In that case, fall back to
+  // exec_path.
+  const std::string& exec_path = exec_path_;
+  return exec_path.substr(0, exec_path.find_last_of(kPathSeparator));
+}
+
+void Environment::add_refs(int64_t diff) {
+  task_queues_async_refs_ += diff;
+  CHECK_GE(task_queues_async_refs_, 0);
+  if (task_queues_async_refs_ == 0)
+    uv_unref(reinterpret_cast<uv_handle_t*>(&task_queues_async_));
+  else
+    uv_ref(reinterpret_cast<uv_handle_t*>(&task_queues_async_));
+}
+
+uv_buf_t Environment::allocate_managed_buffer(const size_t suggested_size) {
+  NoArrayBufferZeroFillScope no_zero_fill_scope(isolate_data());
+  std::unique_ptr<v8::BackingStore> bs =
+      v8::ArrayBuffer::NewBackingStore(isolate(), suggested_size);
+  uv_buf_t buf = uv_buf_init(static_cast<char*>(bs->Data()), bs->ByteLength());
+  released_allocated_buffers_.emplace(buf.base, std::move(bs));
+  return buf;
+}
+
+std::unique_ptr<v8::BackingStore> Environment::release_managed_buffer(
+    const uv_buf_t& buf) {
+  std::unique_ptr<v8::BackingStore> bs;
+  if (buf.base != nullptr) {
+    auto it = released_allocated_buffers_.find(buf.base);
+    CHECK_NE(it, released_allocated_buffers_.end());
+    bs = std::move(it->second);
+    released_allocated_buffers_.erase(it);
+  }
+  return bs;
 }
 
 void Environment::CreateProperties() {
   HandleScope handle_scope(isolate_);
   Local<Context> ctx = context();
-  Local<FunctionTemplate> templ = FunctionTemplate::New(isolate());
-  templ->InstanceTemplate()->SetInternalFieldCount(1);
-  Local<Object> obj = templ->GetFunction(ctx)
-                          .ToLocalChecked()
-                          ->NewInstance(ctx)
-                          .ToLocalChecked();
-  obj->SetAlignedPointerInInternalField(0, this);
-  set_as_callback_data(obj);
-  set_as_callback_data_template(templ);
+
+  {
+    Context::Scope context_scope(ctx);
+    Local<FunctionTemplate> templ = FunctionTemplate::New(isolate());
+    templ->InstanceTemplate()->SetInternalFieldCount(
+        BaseObject::kInternalFieldCount);
+    templ->Inherit(BaseObject::GetConstructorTemplate(this));
+
+    set_binding_data_ctor_template(templ);
+  }
 
   // Store primordials setup by the per-context script in the environment.
   Local<Object> per_context_bindings =
@@ -256,6 +605,29 @@ void Environment::CreateProperties() {
       per_context_bindings->Get(ctx, primordials_string()).ToLocalChecked();
   CHECK(primordials->IsObject());
   set_primordials(primordials.As<Object>());
+
+  Local<String> prototype_string =
+      FIXED_ONE_BYTE_STRING(isolate(), "prototype");
+
+#define V(EnvPropertyName, PrimordialsPropertyName)                            \
+  {                                                                            \
+    Local<Value> ctor =                                                        \
+        primordials.As<Object>()                                               \
+            ->Get(ctx,                                                         \
+                  FIXED_ONE_BYTE_STRING(isolate(), PrimordialsPropertyName))   \
+            .ToLocalChecked();                                                 \
+    CHECK(ctor->IsObject());                                                   \
+    Local<Value> prototype =                                                   \
+        ctor.As<Object>()->Get(ctx, prototype_string).ToLocalChecked();        \
+    CHECK(prototype->IsObject());                                              \
+    set_##EnvPropertyName(prototype.As<Object>());                             \
+  }
+
+  V(primordials_safe_map_prototype_object, "SafeMap");
+  V(primordials_safe_set_prototype_object, "SafeSet");
+  V(primordials_safe_weak_map_prototype_object, "SafeWeakMap");
+  V(primordials_safe_weak_set_prototype_object, "SafeWeakSet");
+#undef V
 
   Local<Object> process_object =
       node::CreateProcessObject(this).FromMaybe(Local<Object>());
@@ -289,70 +661,77 @@ std::string GetExecPath(const std::vector<std::string>& argv) {
 }
 
 Environment::Environment(IsolateData* isolate_data,
-                         Local<Context> context,
+                         Isolate* isolate,
                          const std::vector<std::string>& args,
                          const std::vector<std::string>& exec_args,
-                         Flags flags,
-                         uint64_t thread_id)
-    : isolate_(context->GetIsolate()),
+                         const EnvSerializeInfo* env_info,
+                         EnvironmentFlags::Flags flags,
+                         ThreadId thread_id)
+    : isolate_(isolate),
       isolate_data_(isolate_data),
-      immediate_info_(context->GetIsolate()),
-      tick_info_(context->GetIsolate()),
+      async_hooks_(isolate, MAYBE_FIELD_PTR(env_info, async_hooks)),
+      immediate_info_(isolate, MAYBE_FIELD_PTR(env_info, immediate_info)),
+      tick_info_(isolate, MAYBE_FIELD_PTR(env_info, tick_info)),
       timer_base_(uv_now(isolate_data->event_loop())),
       exec_argv_(exec_args),
       argv_(args),
       exec_path_(GetExecPath(args)),
-      should_abort_on_uncaught_toggle_(isolate_, 1),
-      stream_base_state_(isolate_, StreamBase::kNumStreamBaseStateFields),
+      exiting_(isolate_, 1, MAYBE_FIELD_PTR(env_info, exiting)),
+      should_abort_on_uncaught_toggle_(
+          isolate_,
+          1,
+          MAYBE_FIELD_PTR(env_info, should_abort_on_uncaught_toggle)),
+      stream_base_state_(isolate_,
+                         StreamBase::kNumStreamBaseStateFields,
+                         MAYBE_FIELD_PTR(env_info, stream_base_state)),
+      time_origin_(PERFORMANCE_NOW()),
+      time_origin_timestamp_(GetCurrentTimeInMicroseconds()),
       flags_(flags),
-      thread_id_(thread_id == kNoThreadId ? AllocateThreadId() : thread_id),
-      fs_stats_field_array_(isolate_, kFsStatsBufferLength),
-      fs_stats_field_bigint_array_(isolate_, kFsStatsBufferLength),
-      context_(context->GetIsolate(), context) {
+      thread_id_(thread_id.id == static_cast<uint64_t>(-1)
+                     ? AllocateEnvironmentThreadId().id
+                     : thread_id.id) {
   // We'll be creating new objects so make sure we've entered the context.
-  HandleScope handle_scope(isolate());
-  Context::Scope context_scope(context);
+  HandleScope handle_scope(isolate);
+
+  // Set some flags if only kDefaultFlags was passed. This can make API version
+  // transitions easier for embedders.
+  if (flags_ & EnvironmentFlags::kDefaultFlags) {
+    flags_ = flags_ |
+        EnvironmentFlags::kOwnsProcessState |
+        EnvironmentFlags::kOwnsInspector;
+  }
 
   set_env_vars(per_process::system_environment);
+  enabled_debug_list_.Parse(env_vars(), isolate);
 
   // We create new copies of the per-Environment option sets, so that it is
   // easier to modify them after Environment creation. The defaults are
   // part of the per-Isolate option set, for which in turn the defaults are
   // part of the per-process option set.
-  options_.reset(new EnvironmentOptions(*isolate_data->options()->per_env));
-  inspector_host_port_.reset(new HostPort(options_->debug_options().host_port));
+  options_ = std::make_shared<EnvironmentOptions>(
+      *isolate_data->options()->per_env);
+  inspector_host_port_ = std::make_shared<ExclusiveAccess<HostPort>>(
+      options_->debug_options().host_port);
+
+  if (!(flags_ & EnvironmentFlags::kOwnsProcessState)) {
+    set_abort_on_uncaught_exception(false);
+  }
 
 #if HAVE_INSPECTOR
   // We can only create the inspector agent after having cloned the options.
   inspector_agent_ = std::make_unique<inspector::Agent>(this);
 #endif
 
-  AssignToContext(context, ContextInfo(""));
-
   if (tracing::AgentWriterHandle* writer = GetTracingAgentWriter()) {
     trace_state_observer_ = std::make_unique<TrackingTraceStateObserver>(this);
-    TracingController* tracing_controller = writer->GetTracingController();
-    tracing_controller->AddTraceStateObserver(trace_state_observer_.get());
+    if (TracingController* tracing_controller = writer->GetTracingController())
+      tracing_controller->AddTraceStateObserver(trace_state_observer_.get());
   }
 
   destroy_async_id_list_.reserve(512);
-  BeforeExit(
-      [](void* arg) {
-        Environment* env = static_cast<Environment*>(arg);
-        if (!env->destroy_async_id_list()->empty())
-          AsyncWrap::DestroyAsyncIdsCallback(env);
-      },
-      this);
 
-  performance_state_ =
-      std::make_unique<performance::performance_state>(isolate());
-  performance_state_->Mark(
-      performance::NODE_PERFORMANCE_MILESTONE_ENVIRONMENT);
-  performance_state_->Mark(performance::NODE_PERFORMANCE_MILESTONE_NODE_START,
-                           per_process::node_start_time);
-  performance_state_->Mark(
-      performance::NODE_PERFORMANCE_MILESTONE_V8_START,
-      performance::performance_v8_start);
+  performance_state_ = std::make_unique<performance::PerformanceState>(
+      isolate, MAYBE_FIELD_PTR(env_info, performance_state));
 
   if (*TRACE_EVENT_API_GET_CATEGORY_GROUP_ENABLED(
           TRACING_CATEGORY_NODE1(environment)) != 0) {
@@ -369,30 +748,92 @@ Environment::Environment(IsolateData* isolate_data,
                                       "args",
                                       std::move(traced_value));
   }
+}
+
+Environment::Environment(IsolateData* isolate_data,
+                         Local<Context> context,
+                         const std::vector<std::string>& args,
+                         const std::vector<std::string>& exec_args,
+                         const EnvSerializeInfo* env_info,
+                         EnvironmentFlags::Flags flags,
+                         ThreadId thread_id)
+    : Environment(isolate_data,
+                  context->GetIsolate(),
+                  args,
+                  exec_args,
+                  env_info,
+                  flags,
+                  thread_id) {
+  InitializeMainContext(context, env_info);
+}
+
+void Environment::InitializeMainContext(Local<Context> context,
+                                        const EnvSerializeInfo* env_info) {
+  context_.Reset(context->GetIsolate(), context);
+  AssignToContext(context, ContextInfo(""));
+  if (env_info != nullptr) {
+    DeserializeProperties(env_info);
+  } else {
+    CreateProperties();
+  }
+
+  if (!options_->force_async_hooks_checks) {
+    async_hooks_.no_force_checks();
+  }
 
   // By default, always abort when --abort-on-uncaught-exception was passed.
   should_abort_on_uncaught_toggle_[0] = 1;
 
-  std::string debug_cats;
-  credentials::SafeGetenv("NODE_DEBUG_NATIVE", &debug_cats, this);
-  set_debug_categories(debug_cats, true);
+  // The process is not exiting by default.
+  set_exiting(false);
 
-  if (options_->no_force_async_hooks_checks) {
-    async_hooks_.no_force_checks();
+  performance_state_->Mark(performance::NODE_PERFORMANCE_MILESTONE_ENVIRONMENT,
+                           time_origin_);
+  performance_state_->Mark(performance::NODE_PERFORMANCE_MILESTONE_NODE_START,
+                           per_process::node_start_time);
+
+  if (per_process::v8_initialized) {
+    performance_state_->Mark(performance::NODE_PERFORMANCE_MILESTONE_V8_START,
+                            performance::performance_v8_start);
   }
-
-  // TODO(joyeecheung): deserialize when the snapshot covers the environment
-  // properties.
-  CreateProperties();
 }
 
 Environment::~Environment() {
+  if (Environment** interrupt_data = interrupt_data_.load()) {
+    // There are pending RequestInterrupt() callbacks. Tell them not to run,
+    // then force V8 to run interrupts by compiling and running an empty script
+    // so as not to leak memory.
+    *interrupt_data = nullptr;
+
+    Isolate::AllowJavascriptExecutionScope allow_js_here(isolate());
+    HandleScope handle_scope(isolate());
+    TryCatch try_catch(isolate());
+    Context::Scope context_scope(context());
+
+#ifdef DEBUG
+    bool consistency_check = false;
+    isolate()->RequestInterrupt([](Isolate*, void* data) {
+      *static_cast<bool*>(data) = true;
+    }, &consistency_check);
+#endif
+
+    Local<Script> script;
+    if (Script::Compile(context(), String::Empty(isolate())).ToLocal(&script))
+      USE(script->Run(context()));
+
+    DCHECK(consistency_check);
+  }
+
+  // FreeEnvironment() should have set this.
+  CHECK(is_stopping());
+
+  if (options_->heap_snapshot_near_heap_limit > heap_limit_snapshot_taken_) {
+    isolate_->RemoveNearHeapLimitCallback(Environment::NearHeapLimitCallback,
+                                          0);
+  }
+
   isolate()->GetHeapProfiler()->RemoveBuildEmbedderGraphCallback(
       BuildEmbedderGraph, this);
-
-  // Make sure there are no re-used libuv wrapper objects.
-  // CleanupHandles() should have removed all of them.
-  CHECK(file_handle_read_wrap_freelist_.empty());
 
   HandleScope handle_scope(isolate());
 
@@ -402,20 +843,15 @@ Environment::~Environment() {
   inspector_agent_.reset();
 #endif
 
-  context()->SetAlignedPointerInEmbedderData(
-      ContextEmbedderIndex::kEnvironment, nullptr);
+  context()->SetAlignedPointerInEmbedderData(ContextEmbedderIndex::kEnvironment,
+                                             nullptr);
 
   if (trace_state_observer_) {
     tracing::AgentWriterHandle* writer = GetTracingAgentWriter();
     CHECK_NOT_NULL(writer);
-    TracingController* tracing_controller = writer->GetTracingController();
-    tracing_controller->RemoveTraceStateObserver(trace_state_observer_.get());
+    if (TracingController* tracing_controller = writer->GetTracingController())
+      tracing_controller->RemoveTraceStateObserver(trace_state_observer_.get());
   }
-
-  delete[] heap_statistics_buffer_;
-  delete[] heap_space_statistics_buffer_;
-  delete[] http_parser_buffer_;
-  delete[] heap_code_statistics_buffer_;
 
   TRACE_EVENT_NESTABLE_ASYNC_END0(
     TRACING_CATEGORY_NODE1(environment), "Environment", this);
@@ -431,43 +867,53 @@ Environment::~Environment() {
       addon.Close();
     }
   }
+
+  CHECK_EQ(base_object_count_, 0);
 }
 
-void Environment::InitializeLibuv(bool start_profiler_idle_notifier) {
+void Environment::InitializeLibuv() {
   HandleScope handle_scope(isolate());
   Context::Scope context_scope(context());
 
   CHECK_EQ(0, uv_timer_init(event_loop(), timer_handle()));
   uv_unref(reinterpret_cast<uv_handle_t*>(timer_handle()));
 
-  uv_check_init(event_loop(), immediate_check_handle());
+  CHECK_EQ(0, uv_check_init(event_loop(), immediate_check_handle()));
   uv_unref(reinterpret_cast<uv_handle_t*>(immediate_check_handle()));
 
-  uv_idle_init(event_loop(), immediate_idle_handle());
+  CHECK_EQ(0, uv_idle_init(event_loop(), immediate_idle_handle()));
 
-  uv_check_start(immediate_check_handle(), CheckImmediate);
+  CHECK_EQ(0, uv_check_start(immediate_check_handle(), CheckImmediate));
 
   // Inform V8's CPU profiler when we're idle.  The profiler is sampling-based
   // but not all samples are created equal; mark the wall clock time spent in
   // epoll_wait() and friends so profiling tools can filter it out.  The samples
   // still end up in v8.log but with state=IDLE rather than state=EXTERNAL.
-  // TODO(bnoordhuis) Depends on a libuv implementation detail that we should
-  // probably fortify in the API contract, namely that the last started prepare
-  // or check watcher runs first.  It's not 100% foolproof; if an add-on starts
-  // a prepare or check watcher after us, any samples attributed to its callback
-  // will be recorded with state=IDLE.
-  uv_prepare_init(event_loop(), &idle_prepare_handle_);
-  uv_check_init(event_loop(), &idle_check_handle_);
+  CHECK_EQ(0, uv_prepare_init(event_loop(), &idle_prepare_handle_));
+  CHECK_EQ(0, uv_check_init(event_loop(), &idle_check_handle_));
+
+  CHECK_EQ(0, uv_async_init(
+      event_loop(),
+      &task_queues_async_,
+      [](uv_async_t* async) {
+        Environment* env = ContainerOf(
+            &Environment::task_queues_async_, async);
+        HandleScope handle_scope(env->isolate());
+        Context::Scope context_scope(env->context());
+        env->RunAndClearNativeImmediates();
+      }));
   uv_unref(reinterpret_cast<uv_handle_t*>(&idle_prepare_handle_));
   uv_unref(reinterpret_cast<uv_handle_t*>(&idle_check_handle_));
+  uv_unref(reinterpret_cast<uv_handle_t*>(&task_queues_async_));
 
-  thread_stopper()->Install(
-    this, static_cast<void*>(this), [](uv_async_t* handle) {
-      Environment* env = static_cast<Environment*>(handle->data);
-      uv_stop(env->event_loop());
-    });
-  thread_stopper()->set_stopped(false);
-  uv_unref(reinterpret_cast<uv_handle_t*>(thread_stopper()->GetHandle()));
+  {
+    Mutex::ScopedLock lock(native_immediates_threadsafe_mutex_);
+    task_queues_async_initialized_ = true;
+    if (native_immediates_threadsafe_.size() > 0 ||
+        native_immediates_interrupts_.size() > 0) {
+      uv_async_send(&task_queues_async_);
+    }
+  }
 
   // Register clean-up cb to be called to clean up the handles
   // when the environment is freed, note that they are not cleaned in
@@ -475,19 +921,14 @@ void Environment::InitializeLibuv(bool start_profiler_idle_notifier) {
   // FreeEnvironment.
   RegisterHandleCleanups();
 
-  if (start_profiler_idle_notifier) {
-    StartProfilerIdleNotifier();
-  }
-
-  static uv_once_t init_once = UV_ONCE_INIT;
-  uv_once(&init_once, InitThreadLocalOnce);
-  uv_key_set(&thread_local_env, this);
+  StartProfilerIdleNotifier();
 }
 
 void Environment::ExitEnv() {
   set_can_call_into_js(false);
-  thread_stopper()->Stop();
+  set_stopping(true);
   isolate_->TerminateExecution();
+  SetImmediateThreadsafe([](Environment* env) { uv_stop(env->event_loop()); });
 }
 
 void Environment::RegisterHandleCleanups() {
@@ -502,29 +943,28 @@ void Environment::RegisterHandleCleanups() {
     });
   };
 
-  RegisterHandleCleanup(
-      reinterpret_cast<uv_handle_t*>(timer_handle()),
-      close_and_finish,
-      nullptr);
-  RegisterHandleCleanup(
-      reinterpret_cast<uv_handle_t*>(immediate_check_handle()),
-      close_and_finish,
-      nullptr);
-  RegisterHandleCleanup(
-      reinterpret_cast<uv_handle_t*>(immediate_idle_handle()),
-      close_and_finish,
-      nullptr);
-  RegisterHandleCleanup(
-      reinterpret_cast<uv_handle_t*>(&idle_prepare_handle_),
-      close_and_finish,
-      nullptr);
-  RegisterHandleCleanup(
-      reinterpret_cast<uv_handle_t*>(&idle_check_handle_),
-      close_and_finish,
-      nullptr);
+  auto register_handle = [&](uv_handle_t* handle) {
+    RegisterHandleCleanup(handle, close_and_finish, nullptr);
+  };
+  register_handle(reinterpret_cast<uv_handle_t*>(timer_handle()));
+  register_handle(reinterpret_cast<uv_handle_t*>(immediate_check_handle()));
+  register_handle(reinterpret_cast<uv_handle_t*>(immediate_idle_handle()));
+  register_handle(reinterpret_cast<uv_handle_t*>(&idle_prepare_handle_));
+  register_handle(reinterpret_cast<uv_handle_t*>(&idle_check_handle_));
+  register_handle(reinterpret_cast<uv_handle_t*>(&task_queues_async_));
 }
 
 void Environment::CleanupHandles() {
+  {
+    Mutex::ScopedLock lock(native_immediates_threadsafe_mutex_);
+    task_queues_async_initialized_ = false;
+  }
+
+  Isolate::DisallowJavascriptExecutionScope disallow_js(isolate(),
+      Isolate::DisallowJavascriptExecutionScope::THROW_ON_FAILURE);
+
+  RunAndClearNativeImmediates(true /* skip unrefed SetImmediate()s */);
+
   for (ReqWrapBase* request : req_wrap_queue_)
     request->Cancel();
 
@@ -540,31 +980,17 @@ void Environment::CleanupHandles() {
          !handle_wrap_queue_.IsEmpty()) {
     uv_run(event_loop(), UV_RUN_ONCE);
   }
-
-  file_handle_read_wrap_freelist_.clear();
 }
 
 void Environment::StartProfilerIdleNotifier() {
-  if (profiler_idle_notifier_started_)
-    return;
-
-  profiler_idle_notifier_started_ = true;
-
   uv_prepare_start(&idle_prepare_handle_, [](uv_prepare_t* handle) {
     Environment* env = ContainerOf(&Environment::idle_prepare_handle_, handle);
     env->isolate()->SetIdle(true);
   });
-
   uv_check_start(&idle_check_handle_, [](uv_check_t* handle) {
     Environment* env = ContainerOf(&Environment::idle_check_handle_, handle);
     env->isolate()->SetIdle(false);
   });
-}
-
-void Environment::StopProfilerIdleNotifier() {
-  profiler_idle_notifier_started_ = false;
-  uv_prepare_stop(&idle_prepare_handle_);
-  uv_check_stop(&idle_check_handle_);
 }
 
 void Environment::PrintSyncTrace() const {
@@ -574,19 +1000,41 @@ void Environment::PrintSyncTrace() const {
 
   fprintf(
       stderr, "(node:%d) WARNING: Detected use of sync API\n", uv_os_getpid());
-  PrintStackTrace(
-      isolate(),
-      StackTrace::CurrentStackTrace(isolate(), 10, StackTrace::kDetailed));
+  PrintStackTrace(isolate(),
+                  StackTrace::CurrentStackTrace(
+                      isolate(), stack_trace_limit(), StackTrace::kDetailed));
+}
+
+MaybeLocal<Value> Environment::RunSnapshotSerializeCallback() const {
+  EscapableHandleScope handle_scope(isolate());
+  if (!snapshot_serialize_callback().IsEmpty()) {
+    Context::Scope context_scope(context());
+    return handle_scope.EscapeMaybe(snapshot_serialize_callback()->Call(
+        context(), v8::Undefined(isolate()), 0, nullptr));
+  }
+  return handle_scope.Escape(Undefined(isolate()));
+}
+
+MaybeLocal<Value> Environment::RunSnapshotDeserializeMain() const {
+  EscapableHandleScope handle_scope(isolate());
+  if (!snapshot_deserialize_main().IsEmpty()) {
+    Context::Scope context_scope(context());
+    return handle_scope.EscapeMaybe(snapshot_deserialize_main()->Call(
+        context(), v8::Undefined(isolate()), 0, nullptr));
+  }
+  return handle_scope.Escape(Undefined(isolate()));
 }
 
 void Environment::RunCleanup() {
   started_cleanup_ = true;
-  TraceEventScope trace_scope(TRACING_CATEGORY_NODE1(environment),
-                              "RunCleanup", this);
-  thread_stopper()->Uninstall();
+  TRACE_EVENT0(TRACING_CATEGORY_NODE1(environment), "RunCleanup");
+  bindings_.clear();
   CleanupHandles();
 
-  while (!cleanup_hooks_.empty()) {
+  while (!cleanup_hooks_.empty() ||
+         native_immediates_.size() > 0 ||
+         native_immediates_threadsafe_.size() > 0 ||
+         native_immediates_interrupts_.size() > 0) {
     // Copy into a vector, since we can't sort an unordered_set in-place.
     std::vector<CleanupHookCallback> callbacks(
         cleanup_hooks_.begin(), cleanup_hooks_.end());
@@ -612,24 +1060,16 @@ void Environment::RunCleanup() {
     }
     CleanupHandles();
   }
-}
 
-void Environment::RunBeforeExitCallbacks() {
-  TraceEventScope trace_scope(TRACING_CATEGORY_NODE1(environment),
-                              "BeforeExit", this);
-  for (ExitCallback before_exit : before_exit_functions_) {
-    before_exit.cb_(before_exit.arg_);
+  for (const int fd : unmanaged_fds_) {
+    uv_fs_t close_req;
+    uv_fs_close(nullptr, &close_req, fd, nullptr);
+    uv_fs_req_cleanup(&close_req);
   }
-  before_exit_functions_.clear();
-}
-
-void Environment::BeforeExit(void (*cb)(void* arg), void* arg) {
-  before_exit_functions_.push_back(ExitCallback{cb, arg});
 }
 
 void Environment::RunAtExitCallbacks() {
-  TraceEventScope trace_scope(TRACING_CATEGORY_NODE1(environment),
-                              "AtExit", this);
+  TRACE_EVENT0(TRACING_CATEGORY_NODE1(environment), "AtExit");
   for (ExitCallback at_exit : at_exit_functions_) {
     at_exit.cb_(at_exit.arg_);
   }
@@ -637,46 +1077,111 @@ void Environment::RunAtExitCallbacks() {
 }
 
 void Environment::AtExit(void (*cb)(void* arg), void* arg) {
-  at_exit_functions_.push_back(ExitCallback{cb, arg});
+  at_exit_functions_.push_front(ExitCallback{cb, arg});
 }
 
-void Environment::RunAndClearNativeImmediates() {
-  TraceEventScope trace_scope(TRACING_CATEGORY_NODE1(environment),
-                              "RunAndClearNativeImmediates", this);
-  size_t ref_count = 0;
-  size_t count = 0;
-  std::unique_ptr<NativeImmediateCallback> head;
-  head.swap(native_immediate_callbacks_head_);
-  native_immediate_callbacks_tail_ = nullptr;
+void Environment::RunAndClearInterrupts() {
+  while (native_immediates_interrupts_.size() > 0) {
+    NativeImmediateQueue queue;
+    {
+      Mutex::ScopedLock lock(native_immediates_threadsafe_mutex_);
+      queue.ConcatMove(std::move(native_immediates_interrupts_));
+    }
+    DebugSealHandleScope seal_handle_scope(isolate());
 
-  auto drain_list = [&]() {
+    while (auto head = queue.Shift())
+      head->Call(this);
+  }
+}
+
+void Environment::RunAndClearNativeImmediates(bool only_refed) {
+  TRACE_EVENT0(TRACING_CATEGORY_NODE1(environment),
+               "RunAndClearNativeImmediates");
+  HandleScope handle_scope(isolate_);
+  InternalCallbackScope cb_scope(this, Object::New(isolate_), { 0, 0 });
+
+  size_t ref_count = 0;
+
+  // Handle interrupts first. These functions are not allowed to throw
+  // exceptions, so we do not need to handle that.
+  RunAndClearInterrupts();
+
+  auto drain_list = [&](NativeImmediateQueue* queue) {
     TryCatchScope try_catch(this);
-    for (; head; head = head->get_next()) {
-      DebugSealHandleScope seal_handle_scope(isolate());
-      count++;
-      if (head->is_refed())
+    DebugSealHandleScope seal_handle_scope(isolate());
+    while (auto head = queue->Shift()) {
+      bool is_refed = head->flags() & CallbackFlags::kRefed;
+      if (is_refed)
         ref_count++;
 
-      head->Call(this);
+      if (is_refed || !only_refed)
+        head->Call(this);
+
+      head.reset();  // Destroy now so that this is also observed by try_catch.
+
       if (UNLIKELY(try_catch.HasCaught())) {
-        if (!try_catch.HasTerminated())
+        if (!try_catch.HasTerminated() && can_call_into_js())
           errors::TriggerUncaughtException(isolate(), try_catch);
 
-        // We are done with the current callback. Move one iteration along,
-        // as if we had completed successfully.
-        head = head->get_next();
         return true;
       }
     }
     return false;
   };
-  while (head && drain_list()) {}
+  while (drain_list(&native_immediates_)) {}
 
-  DCHECK_GE(immediate_info()->count(), count);
-  immediate_info()->count_dec(count);
   immediate_info()->ref_count_dec(ref_count);
+
+  if (immediate_info()->ref_count() == 0)
+    ToggleImmediateRef(false);
+
+  // It is safe to check .size() first, because there is a causal relationship
+  // between pushes to the threadsafe immediate list and this function being
+  // called. For the common case, it's worth checking the size first before
+  // establishing a mutex lock.
+  // This is intentionally placed after the `ref_count` handling, because when
+  // refed threadsafe immediates are created, they are not counted towards the
+  // count in immediate_info() either.
+  NativeImmediateQueue threadsafe_immediates;
+  if (native_immediates_threadsafe_.size() > 0) {
+    Mutex::ScopedLock lock(native_immediates_threadsafe_mutex_);
+    threadsafe_immediates.ConcatMove(std::move(native_immediates_threadsafe_));
+  }
+  while (drain_list(&threadsafe_immediates)) {}
 }
 
+void Environment::RequestInterruptFromV8() {
+  // The Isolate may outlive the Environment, so some logic to handle the
+  // situation in which the Environment is destroyed before the handler runs
+  // is required.
+
+  // We allocate a new pointer to a pointer to this Environment instance, and
+  // try to set it as interrupt_data_. If interrupt_data_ was already set, then
+  // callbacks are already scheduled to run and we can delete our own pointer
+  // and just return. If it was nullptr previously, the Environment** is stored;
+  // ~Environment sets the Environment* contained in it to nullptr, so that
+  // the callback can check whether ~Environment has already run and it is thus
+  // not safe to access the Environment instance itself.
+  Environment** interrupt_data = new Environment*(this);
+  Environment** dummy = nullptr;
+  if (!interrupt_data_.compare_exchange_strong(dummy, interrupt_data)) {
+    delete interrupt_data;
+    return;  // Already scheduled.
+  }
+
+  isolate()->RequestInterrupt([](Isolate* isolate, void* data) {
+    std::unique_ptr<Environment*> env_ptr { static_cast<Environment**>(data) };
+    Environment* env = *env_ptr;
+    if (env == nullptr) {
+      // The Environment has already been destroyed. That should be okay; any
+      // callback added before the Environment shuts down would have been
+      // handled during cleanup.
+      return;
+    }
+    env->interrupt_data_.store(nullptr);
+    env->RunAndClearInterrupts();
+  }, interrupt_data);
+}
 
 void Environment::ScheduleTimer(int64_t duration_ms) {
   if (started_cleanup_) return;
@@ -695,8 +1200,7 @@ void Environment::ToggleTimerRef(bool ref) {
 
 void Environment::RunTimers(uv_timer_t* handle) {
   Environment* env = Environment::from_timer_handle(handle);
-  TraceEventScope trace_scope(TRACING_CATEGORY_NODE1(environment),
-                              "RunTimers", env);
+  TRACE_EVENT0(TRACING_CATEGORY_NODE1(environment), "RunTimers");
 
   if (!env->can_call_into_js())
     return;
@@ -757,18 +1261,14 @@ void Environment::RunTimers(uv_timer_t* handle) {
 
 void Environment::CheckImmediate(uv_check_t* handle) {
   Environment* env = Environment::from_immediate_check_handle(handle);
-  TraceEventScope trace_scope(TRACING_CATEGORY_NODE1(environment),
-                              "CheckImmediate", env);
-
-  if (env->immediate_info()->count() == 0)
-    return;
+  TRACE_EVENT0(TRACING_CATEGORY_NODE1(environment), "CheckImmediate");
 
   HandleScope scope(env->isolate());
   Context::Scope context_scope(env->context());
 
   env->RunAndClearNativeImmediates();
 
-  if (!env->can_call_into_js())
+  if (env->immediate_info()->count() == 0 || !env->can_call_into_js())
     return;
 
   do {
@@ -805,29 +1305,6 @@ Local<Value> Environment::GetNow() {
     return Integer::NewFromUnsigned(isolate(), static_cast<uint32_t>(now));
   else
     return Number::New(isolate(), static_cast<double>(now));
-}
-
-void Environment::set_debug_categories(const std::string& cats, bool enabled) {
-  std::string debug_categories = cats;
-  while (!debug_categories.empty()) {
-    std::string::size_type comma_pos = debug_categories.find(',');
-    std::string wanted = ToLower(debug_categories.substr(0, comma_pos));
-
-#define V(name)                                                          \
-    {                                                                    \
-      static const std::string available_category = ToLower(#name);      \
-      if (available_category.find(wanted) != std::string::npos)          \
-        set_debug_enabled(DebugCategory::name, enabled);                 \
-    }
-
-    DEBUG_CATEGORY_NAMES(V)
-#undef V
-
-    if (comma_pos == std::string::npos)
-      break;
-    // Use everything after the `,` as the list for the next iteration.
-    debug_categories = debug_categories.substr(comma_pos + 1);
-  }
 }
 
 void CollectExceptionInfo(Environment* env,
@@ -890,19 +1367,164 @@ void Environment::CollectUVExceptionInfo(Local<Value> object,
                              syscall, message, path, dest);
 }
 
+ImmediateInfo::ImmediateInfo(Isolate* isolate, const SerializeInfo* info)
+    : fields_(isolate, kFieldsCount, MAYBE_FIELD_PTR(info, fields)) {}
+
+ImmediateInfo::SerializeInfo ImmediateInfo::Serialize(
+    Local<Context> context, SnapshotCreator* creator) {
+  return {fields_.Serialize(context, creator)};
+}
+
+void ImmediateInfo::Deserialize(Local<Context> context) {
+  fields_.Deserialize(context);
+}
+
+std::ostream& operator<<(std::ostream& output,
+                         const ImmediateInfo::SerializeInfo& i) {
+  output << "{ " << i.fields << " }";
+  return output;
+}
+
 void ImmediateInfo::MemoryInfo(MemoryTracker* tracker) const {
   tracker->TrackField("fields", fields_);
+}
+
+TickInfo::SerializeInfo TickInfo::Serialize(Local<Context> context,
+                                            SnapshotCreator* creator) {
+  return {fields_.Serialize(context, creator)};
+}
+
+void TickInfo::Deserialize(Local<Context> context) {
+  fields_.Deserialize(context);
+}
+
+std::ostream& operator<<(std::ostream& output,
+                         const TickInfo::SerializeInfo& i) {
+  output << "{ " << i.fields << " }";
+  return output;
 }
 
 void TickInfo::MemoryInfo(MemoryTracker* tracker) const {
   tracker->TrackField("fields", fields_);
 }
 
+TickInfo::TickInfo(Isolate* isolate, const SerializeInfo* info)
+    : fields_(
+          isolate, kFieldsCount, info == nullptr ? nullptr : &(info->fields)) {}
+
+AsyncHooks::AsyncHooks(Isolate* isolate, const SerializeInfo* info)
+    : async_ids_stack_(isolate, 16 * 2, MAYBE_FIELD_PTR(info, async_ids_stack)),
+      fields_(isolate, kFieldsCount, MAYBE_FIELD_PTR(info, fields)),
+      async_id_fields_(
+          isolate, kUidFieldsCount, MAYBE_FIELD_PTR(info, async_id_fields)),
+      info_(info) {
+  HandleScope handle_scope(isolate);
+  if (info == nullptr) {
+    clear_async_id_stack();
+
+    // Always perform async_hooks checks, not just when async_hooks is enabled.
+    // TODO(AndreasMadsen): Consider removing this for LTS releases.
+    // See discussion in https://github.com/nodejs/node/pull/15454
+    // When removing this, do it by reverting the commit. Otherwise the test
+    // and flag changes won't be included.
+    fields_[kCheck] = 1;
+
+    // kDefaultTriggerAsyncId should be -1, this indicates that there is no
+    // specified default value and it should fallback to the executionAsyncId.
+    // 0 is not used as the magic value, because that indicates a missing
+    // context which is different from a default context.
+    async_id_fields_[AsyncHooks::kDefaultTriggerAsyncId] = -1;
+
+    // kAsyncIdCounter should start at 1 because that'll be the id the execution
+    // context during bootstrap (code that runs before entering uv_run()).
+    async_id_fields_[AsyncHooks::kAsyncIdCounter] = 1;
+  }
+}
+
+void AsyncHooks::Deserialize(Local<Context> context) {
+  async_ids_stack_.Deserialize(context);
+  fields_.Deserialize(context);
+  async_id_fields_.Deserialize(context);
+
+  Local<Array> js_execution_async_resources;
+  if (info_->js_execution_async_resources != 0) {
+    js_execution_async_resources =
+        context->GetDataFromSnapshotOnce<Array>(
+            info_->js_execution_async_resources).ToLocalChecked();
+  } else {
+    js_execution_async_resources = Array::New(context->GetIsolate());
+  }
+  js_execution_async_resources_.Reset(
+      context->GetIsolate(), js_execution_async_resources);
+
+  // The native_execution_async_resources_ field requires v8::Local<> instances
+  // for async calls whose resources were on the stack as JS objects when they
+  // were entered. We cannot recreate this here; however, storing these values
+  // on the JS equivalent gives the same result, so we do that instead.
+  for (size_t i = 0; i < info_->native_execution_async_resources.size(); ++i) {
+    if (info_->native_execution_async_resources[i] == SIZE_MAX)
+      continue;
+    Local<Object> obj = context->GetDataFromSnapshotOnce<Object>(
+                                   info_->native_execution_async_resources[i])
+                               .ToLocalChecked();
+    js_execution_async_resources->Set(context, i, obj).Check();
+  }
+  info_ = nullptr;
+}
+
+std::ostream& operator<<(std::ostream& output,
+                         const AsyncHooks::SerializeInfo& i) {
+  output << "{\n"
+         << "  " << i.async_ids_stack << ",  // async_ids_stack\n"
+         << "  " << i.fields << ",  // fields\n"
+         << "  " << i.async_id_fields << ",  // async_id_fields\n"
+         << "  " << i.js_execution_async_resources
+         << ",  // js_execution_async_resources\n"
+         << "  " << i.native_execution_async_resources
+         << ",  // native_execution_async_resources\n"
+         << "}";
+  return output;
+}
+
+AsyncHooks::SerializeInfo AsyncHooks::Serialize(Local<Context> context,
+                                                SnapshotCreator* creator) {
+  SerializeInfo info;
+  // TODO(joyeecheung): some of these probably don't need to be serialized.
+  info.async_ids_stack = async_ids_stack_.Serialize(context, creator);
+  info.fields = fields_.Serialize(context, creator);
+  info.async_id_fields = async_id_fields_.Serialize(context, creator);
+  if (!js_execution_async_resources_.IsEmpty()) {
+    info.js_execution_async_resources = creator->AddData(
+        context, js_execution_async_resources_.Get(context->GetIsolate()));
+    CHECK_NE(info.js_execution_async_resources, 0);
+  } else {
+    info.js_execution_async_resources = 0;
+  }
+
+  info.native_execution_async_resources.resize(
+      native_execution_async_resources_.size());
+  for (size_t i = 0; i < native_execution_async_resources_.size(); i++) {
+    info.native_execution_async_resources[i] =
+        native_execution_async_resources_[i].IsEmpty() ? SIZE_MAX :
+            creator->AddData(
+                context,
+                native_execution_async_resources_[i]);
+  }
+  CHECK_EQ(contexts_.size(), 1);
+  CHECK_EQ(contexts_[0], env()->context());
+  CHECK(js_promise_hooks_[0].IsEmpty());
+  CHECK(js_promise_hooks_[1].IsEmpty());
+  CHECK(js_promise_hooks_[2].IsEmpty());
+  CHECK(js_promise_hooks_[3].IsEmpty());
+
+  return info;
+}
+
 void AsyncHooks::MemoryInfo(MemoryTracker* tracker) const {
-  tracker->TrackField("providers", providers_);
   tracker->TrackField("async_ids_stack", async_ids_stack_);
   tracker->TrackField("fields", fields_);
   tracker->TrackField("async_id_fields", async_id_fields_);
+  tracker->TrackField("js_promise_hooks", js_promise_hooks_);
 }
 
 void AsyncHooks::grow_async_ids_stack() {
@@ -914,19 +1536,46 @@ void AsyncHooks::grow_async_ids_stack() {
       async_ids_stack_.GetJSArray()).Check();
 }
 
-uv_key_t Environment::thread_local_env = {};
+void AsyncHooks::FailWithCorruptedAsyncStack(double expected_async_id) {
+  fprintf(stderr,
+          "Error: async hook stack has become corrupted ("
+          "actual: %.f, expected: %.f)\n",
+          async_id_fields_.GetValue(kExecutionAsyncId),
+          expected_async_id);
+  DumpBacktrace(stderr);
+  fflush(stderr);
+  if (!env()->abort_on_uncaught_exception())
+    exit(1);
+  fprintf(stderr, "\n");
+  fflush(stderr);
+  ABORT_NO_BACKTRACE();
+}
 
 void Environment::Exit(int exit_code) {
-  if (is_main_thread()) {
-    stop_sub_worker_contexts();
-    DisposePlatform();
-    exit(exit_code);
-  } else {
-    worker_context_->Exit(exit_code);
+  if (options()->trace_exit) {
+    HandleScope handle_scope(isolate());
+    Isolate::DisallowJavascriptExecutionScope disallow_js(
+        isolate(), Isolate::DisallowJavascriptExecutionScope::CRASH_ON_FAILURE);
+
+    if (is_main_thread()) {
+      fprintf(stderr, "(node:%d) ", uv_os_getpid());
+    } else {
+      fprintf(stderr, "(node:%d, thread:%" PRIu64 ") ",
+              uv_os_getpid(), thread_id());
+    }
+
+    fprintf(
+        stderr, "WARNING: Exited the environment with code %d\n", exit_code);
+    PrintStackTrace(isolate(),
+                    StackTrace::CurrentStackTrace(
+                        isolate(), stack_trace_limit(), StackTrace::kDetailed));
   }
+  process_exit_handler_(this, exit_code);
 }
 
 void Environment::stop_sub_worker_contexts() {
+  DCHECK_EQ(Isolate::GetCurrent(), isolate());
+
   while (!sub_worker_contexts_.empty()) {
     Worker* w = *sub_worker_contexts_.begin();
     remove_sub_worker_context(w);
@@ -935,29 +1584,274 @@ void Environment::stop_sub_worker_contexts() {
   }
 }
 
-#if HAVE_INSPECTOR
+Environment* Environment::worker_parent_env() const {
+  if (worker_context() == nullptr) return nullptr;
+  return worker_context()->env();
+}
 
-#endif  // HAVE_INSPECTOR
-
-void MemoryTracker::TrackField(const char* edge_name,
-                               const CleanupHookCallback& value,
-                               const char* node_name) {
-  v8::HandleScope handle_scope(isolate_);
-  // Here, we utilize the fact that CleanupHookCallback instances
-  // are all unique and won't be tracked twice in one BuildEmbedderGraph
-  // callback.
-  MemoryRetainerNode* n =
-      PushNode("CleanupHookCallback", sizeof(value), edge_name);
-  // TODO(joyeecheung): at the moment only arguments of type BaseObject will be
-  // identified and tracked here (based on their deleters),
-  // but we may convert and track other known types here.
-  BaseObject* obj = value.GetBaseObject();
-  if (obj != nullptr && obj->IsDoneInitializing()) {
-    TrackField("arg", obj);
+void Environment::AddUnmanagedFd(int fd) {
+  if (!tracks_unmanaged_fds()) return;
+  auto result = unmanaged_fds_.insert(fd);
+  if (!result.second) {
+    ProcessEmitWarning(
+        this, "File descriptor %d opened in unmanaged mode twice", fd);
   }
-  CHECK_EQ(CurrentNode(), n);
-  CHECK_NE(n->size_, 0);
-  PopNode();
+}
+
+void Environment::RemoveUnmanagedFd(int fd) {
+  if (!tracks_unmanaged_fds()) return;
+  size_t removed_count = unmanaged_fds_.erase(fd);
+  if (removed_count == 0) {
+    ProcessEmitWarning(
+        this, "File descriptor %d closed but not opened in unmanaged mode", fd);
+  }
+}
+
+void Environment::PrintInfoForSnapshotIfDebug() {
+  if (enabled_debug_list()->enabled(DebugCategory::MKSNAPSHOT)) {
+    fprintf(stderr, "BaseObjects at the exit of the Environment:\n");
+    PrintAllBaseObjects();
+    fprintf(stderr, "\nNative modules without cache:\n");
+    for (const auto& s : builtins_without_cache) {
+      fprintf(stderr, "%s\n", s.c_str());
+    }
+    fprintf(stderr, "\nNative modules with cache:\n");
+    for (const auto& s : builtins_with_cache) {
+      fprintf(stderr, "%s\n", s.c_str());
+    }
+    fprintf(stderr, "\nStatic bindings (need to be registered):\n");
+    for (const auto mod : internal_bindings) {
+      fprintf(stderr, "%s:%s\n", mod->nm_filename, mod->nm_modname);
+    }
+  }
+}
+
+void Environment::PrintAllBaseObjects() {
+  size_t i = 0;
+  std::cout << "BaseObjects\n";
+  ForEachBaseObject([&](BaseObject* obj) {
+    std::cout << "#" << i++ << " " << obj << ": " <<
+      obj->MemoryInfoName() << "\n";
+  });
+}
+
+void Environment::VerifyNoStrongBaseObjects() {
+  // When a process exits cleanly, i.e. because the event loop ends up without
+  // things to wait for, the Node.js objects that are left on the heap should
+  // be:
+  //
+  //   1. weak, i.e. ready for garbage collection once no longer referenced, or
+  //   2. detached, i.e. scheduled for destruction once no longer referenced, or
+  //   3. an unrefed libuv handle, i.e. does not keep the event loop alive, or
+  //   4. an inactive libuv handle (essentially the same here)
+  //
+  // There are a few exceptions to this rule, but generally, if there are
+  // C++-backed Node.js objects on the heap that do not fall into the above
+  // categories, we may be looking at a potential memory leak. Most likely,
+  // the cause is a missing MakeWeak() call on the corresponding object.
+  //
+  // In order to avoid this kind of problem, we check the list of BaseObjects
+  // for these criteria. Currently, we only do so when explicitly instructed to
+  // or when in debug mode (where --verify-base-objects is always-on).
+
+  if (!options()->verify_base_objects) return;
+
+  ForEachBaseObject([](BaseObject* obj) {
+    if (obj->IsNotIndicativeOfMemoryLeakAtExit()) return;
+    fprintf(stderr, "Found bad BaseObject during clean exit: %s\n",
+            obj->MemoryInfoName().c_str());
+    fflush(stderr);
+    ABORT();
+  });
+}
+
+EnvSerializeInfo Environment::Serialize(SnapshotCreator* creator) {
+  EnvSerializeInfo info;
+  Local<Context> ctx = context();
+
+  // Currently all modules are compiled without cache in builtin snapshot
+  // builder.
+  info.builtins = std::vector<std::string>(builtins_without_cache.begin(),
+                                           builtins_without_cache.end());
+
+  info.async_hooks = async_hooks_.Serialize(ctx, creator);
+  info.immediate_info = immediate_info_.Serialize(ctx, creator);
+  info.tick_info = tick_info_.Serialize(ctx, creator);
+  info.performance_state = performance_state_->Serialize(ctx, creator);
+  info.exiting = exiting_.Serialize(ctx, creator);
+  info.stream_base_state = stream_base_state_.Serialize(ctx, creator);
+  info.should_abort_on_uncaught_toggle =
+      should_abort_on_uncaught_toggle_.Serialize(ctx, creator);
+
+  uint32_t id = 0;
+#define V(PropertyName, TypeName)                                              \
+  do {                                                                         \
+    Local<TypeName> field = PropertyName();                                    \
+    if (!field.IsEmpty()) {                                                    \
+      size_t index = creator->AddData(ctx, field);                             \
+      info.persistent_values.push_back({#PropertyName, id, index});            \
+    }                                                                          \
+    id++;                                                                      \
+  } while (0);
+  ENVIRONMENT_STRONG_PERSISTENT_VALUES(V)
+#undef V
+
+  // Do this after other creator->AddData() calls so that Snapshotable objects
+  // can use 0 to indicate that a SnapshotIndex is invalid.
+  SerializeSnapshotableObjects(this, creator, &info);
+
+  info.context = creator->AddData(ctx, context());
+  return info;
+}
+
+std::ostream& operator<<(std::ostream& output,
+                         const std::vector<PropInfo>& vec) {
+  output << "{\n";
+  for (const auto& info : vec) {
+    output << "  " << info << ",\n";
+  }
+  output << "}";
+  return output;
+}
+
+std::ostream& operator<<(std::ostream& output, const PropInfo& info) {
+  output << "{ \"" << info.name << "\", " << std::to_string(info.id) << ", "
+         << std::to_string(info.index) << " }";
+  return output;
+}
+
+std::ostream& operator<<(std::ostream& output,
+                         const std::vector<std::string>& vec) {
+  output << "{\n";
+  for (const auto& info : vec) {
+    output << "  \"" << info << "\",\n";
+  }
+  output << "}";
+  return output;
+}
+
+std::ostream& operator<<(std::ostream& output, const EnvSerializeInfo& i) {
+  output << "{\n"
+         << "// -- native_objects begins --\n"
+         << i.native_objects << ",\n"
+         << "// -- native_objects ends --\n"
+         << "// -- builtins begins --\n"
+         << i.builtins << ",\n"
+         << "// -- builtins ends --\n"
+         << "// -- async_hooks begins --\n"
+         << i.async_hooks << ",\n"
+         << "// -- async_hooks ends --\n"
+         << i.tick_info << ",  // tick_info\n"
+         << i.immediate_info << ",  // immediate_info\n"
+         << "// -- performance_state begins --\n"
+         << i.performance_state << ",\n"
+         << "// -- performance_state ends --\n"
+         << i.exiting << ",  // exiting\n"
+         << i.stream_base_state << ",  // stream_base_state\n"
+         << i.should_abort_on_uncaught_toggle
+         << ",  // should_abort_on_uncaught_toggle\n"
+         << "// -- persistent_values begins --\n"
+         << i.persistent_values << ",\n"
+         << "// -- persistent_values ends --\n"
+         << i.context << ",  // context\n"
+         << "}";
+  return output;
+}
+
+void Environment::EnqueueDeserializeRequest(DeserializeRequestCallback cb,
+                                            Local<Object> holder,
+                                            int index,
+                                            InternalFieldInfoBase* info) {
+  DCHECK_EQ(index, BaseObject::kEmbedderType);
+  DeserializeRequest request{cb, {isolate(), holder}, index, info};
+  deserialize_requests_.push_back(std::move(request));
+}
+
+void Environment::RunDeserializeRequests() {
+  HandleScope scope(isolate());
+  Local<Context> ctx = context();
+  Isolate* is = isolate();
+  while (!deserialize_requests_.empty()) {
+    DeserializeRequest request(std::move(deserialize_requests_.front()));
+    deserialize_requests_.pop_front();
+    Local<Object> holder = request.holder.Get(is);
+    request.cb(ctx, holder, request.index, request.info);
+    request.holder.Reset();
+    request.info->Delete();
+  }
+}
+
+void Environment::DeserializeProperties(const EnvSerializeInfo* info) {
+  Local<Context> ctx = context();
+
+  RunDeserializeRequests();
+
+  builtins_in_snapshot = info->builtins;
+  async_hooks_.Deserialize(ctx);
+  immediate_info_.Deserialize(ctx);
+  tick_info_.Deserialize(ctx);
+  performance_state_->Deserialize(ctx);
+  exiting_.Deserialize(ctx);
+  stream_base_state_.Deserialize(ctx);
+  should_abort_on_uncaught_toggle_.Deserialize(ctx);
+
+  if (enabled_debug_list_.enabled(DebugCategory::MKSNAPSHOT)) {
+    fprintf(stderr, "deserializing...\n");
+    std::cerr << *info << "\n";
+  }
+
+  const std::vector<PropInfo>& values = info->persistent_values;
+  size_t i = 0;  // index to the array
+  uint32_t id = 0;
+#define V(PropertyName, TypeName)                                              \
+  do {                                                                         \
+    if (values.size() > i && id == values[i].id) {                             \
+      const PropInfo& d = values[i];                                           \
+      DCHECK_EQ(d.name, #PropertyName);                                        \
+      MaybeLocal<TypeName> maybe_field =                                       \
+          ctx->GetDataFromSnapshotOnce<TypeName>(d.index);                     \
+      Local<TypeName> field;                                                   \
+      if (!maybe_field.ToLocal(&field)) {                                      \
+        fprintf(stderr,                                                        \
+                "Failed to deserialize environment value " #PropertyName       \
+                "\n");                                                         \
+      }                                                                        \
+      set_##PropertyName(field);                                               \
+      i++;                                                                     \
+    }                                                                          \
+    id++;                                                                      \
+  } while (0);
+
+  ENVIRONMENT_STRONG_PERSISTENT_VALUES(V);
+#undef V
+
+  MaybeLocal<Context> maybe_ctx_from_snapshot =
+      ctx->GetDataFromSnapshotOnce<Context>(info->context);
+  Local<Context> ctx_from_snapshot;
+  if (!maybe_ctx_from_snapshot.ToLocal(&ctx_from_snapshot)) {
+    fprintf(stderr,
+            "Failed to deserialize context back reference from the snapshot\n");
+  }
+  CHECK_EQ(ctx_from_snapshot, ctx);
+}
+
+uint64_t GuessMemoryAvailableToTheProcess() {
+  uint64_t free_in_system = uv_get_free_memory();
+  size_t allowed = uv_get_constrained_memory();
+  if (allowed == 0) {
+    return free_in_system;
+  }
+  size_t rss;
+  int err = uv_resident_set_memory(&rss);
+  if (err) {
+    return free_in_system;
+  }
+  if (allowed < rss) {
+    // Something is probably wrong. Fallback to the free memory.
+    return free_in_system;
+  }
+  // There may still be room for swap, but we will just leave it here.
+  return allowed - rss;
 }
 
 void Environment::BuildEmbedderGraph(Isolate* isolate,
@@ -966,6 +1860,135 @@ void Environment::BuildEmbedderGraph(Isolate* isolate,
   MemoryTracker tracker(isolate, graph);
   Environment* env = static_cast<Environment*>(data);
   tracker.Track(env);
+  env->ForEachBaseObject([&](BaseObject* obj) {
+    if (obj->IsDoneInitializing())
+      tracker.Track(obj);
+  });
+}
+
+size_t Environment::NearHeapLimitCallback(void* data,
+                                          size_t current_heap_limit,
+                                          size_t initial_heap_limit) {
+  Environment* env = static_cast<Environment*>(data);
+
+  Debug(env,
+        DebugCategory::DIAGNOSTICS,
+        "Invoked NearHeapLimitCallback, processing=%d, "
+        "current_limit=%" PRIu64 ", "
+        "initial_limit=%" PRIu64 "\n",
+        env->is_processing_heap_limit_callback_,
+        static_cast<uint64_t>(current_heap_limit),
+        static_cast<uint64_t>(initial_heap_limit));
+
+  size_t max_young_gen_size = env->isolate_data()->max_young_gen_size;
+  size_t young_gen_size = 0;
+  size_t old_gen_size = 0;
+
+  HeapSpaceStatistics stats;
+  size_t num_heap_spaces = env->isolate()->NumberOfHeapSpaces();
+  for (size_t i = 0; i < num_heap_spaces; ++i) {
+    env->isolate()->GetHeapSpaceStatistics(&stats, i);
+    if (strcmp(stats.space_name(), "new_space") == 0 ||
+        strcmp(stats.space_name(), "new_large_object_space") == 0) {
+      young_gen_size += stats.space_used_size();
+    } else {
+      old_gen_size += stats.space_used_size();
+    }
+  }
+
+  Debug(env,
+        DebugCategory::DIAGNOSTICS,
+        "max_young_gen_size=%" PRIu64 ", "
+        "young_gen_size=%" PRIu64 ", "
+        "old_gen_size=%" PRIu64 ", "
+        "total_size=%" PRIu64 "\n",
+        static_cast<uint64_t>(max_young_gen_size),
+        static_cast<uint64_t>(young_gen_size),
+        static_cast<uint64_t>(old_gen_size),
+        static_cast<uint64_t>(young_gen_size + old_gen_size));
+
+  uint64_t available = GuessMemoryAvailableToTheProcess();
+  // TODO(joyeecheung): get a better estimate about the native memory
+  // usage into the overhead, e.g. based on the count of objects.
+  uint64_t estimated_overhead = max_young_gen_size;
+  Debug(env,
+        DebugCategory::DIAGNOSTICS,
+        "Estimated available memory=%" PRIu64 ", "
+        "estimated overhead=%" PRIu64 "\n",
+        static_cast<uint64_t>(available),
+        static_cast<uint64_t>(estimated_overhead));
+
+  // This might be hit when the snapshot is being taken in another
+  // NearHeapLimitCallback invocation.
+  // When taking the snapshot, objects in the young generation may be
+  // promoted to the old generation, result in increased heap usage,
+  // but it should be no more than the young generation size.
+  // Ideally, this should be as small as possible - the heap limit
+  // can only be restored when the heap usage falls down below the
+  // new limit, so in a heap with unbounded growth the isolate
+  // may eventually crash with this new limit - effectively raising
+  // the heap limit to the new one.
+  if (env->is_processing_heap_limit_callback_) {
+    size_t new_limit = current_heap_limit + max_young_gen_size;
+    Debug(env,
+          DebugCategory::DIAGNOSTICS,
+          "Not generating snapshots in nested callback. "
+          "new_limit=%" PRIu64 "\n",
+          static_cast<uint64_t>(new_limit));
+    return new_limit;
+  }
+
+  // Estimate whether the snapshot is going to use up all the memory
+  // available to the process. If so, just give up to prevent the system
+  // from killing the process for a system OOM.
+  if (estimated_overhead > available) {
+    Debug(env,
+          DebugCategory::DIAGNOSTICS,
+          "Not generating snapshots because it's too risky.\n");
+    env->isolate()->RemoveNearHeapLimitCallback(NearHeapLimitCallback,
+                                                initial_heap_limit);
+    // The new limit must be higher than current_heap_limit or V8 might
+    // crash.
+    return current_heap_limit + 1;
+  }
+
+  // Take the snapshot synchronously.
+  env->is_processing_heap_limit_callback_ = true;
+
+  std::string dir = env->options()->diagnostic_dir;
+  if (dir.empty()) {
+    dir = env->GetCwd();
+  }
+  DiagnosticFilename name(env, "Heap", "heapsnapshot");
+  std::string filename = dir + kPathSeparator + (*name);
+
+  Debug(env, DebugCategory::DIAGNOSTICS, "Start generating %s...\n", *name);
+
+  // Remove the callback first in case it's triggered when generating
+  // the snapshot.
+  env->isolate()->RemoveNearHeapLimitCallback(NearHeapLimitCallback,
+                                              initial_heap_limit);
+
+  heap::WriteSnapshot(env, filename.c_str());
+  env->heap_limit_snapshot_taken_ += 1;
+
+  // Don't take more snapshots than the number specified by
+  // --heapsnapshot-near-heap-limit.
+  if (env->heap_limit_snapshot_taken_ <
+      env->options_->heap_snapshot_near_heap_limit) {
+    env->isolate()->AddNearHeapLimitCallback(NearHeapLimitCallback, env);
+  }
+
+  FPrintF(stderr, "Wrote snapshot to %s\n", filename.c_str());
+  // Tell V8 to reset the heap limit once the heap usage falls down to
+  // 95% of the initial limit.
+  env->isolate()->AutomaticallyRestoreInitialHeapLimit(0.95);
+
+  env->is_processing_heap_limit_callback_ = false;
+
+  // The new limit must be higher than current_heap_limit or V8 might
+  // crash.
+  return current_heap_limit + 1;
 }
 
 inline size_t Environment::SelfSize() const {
@@ -974,7 +1997,6 @@ inline size_t Environment::SelfSize() const {
   // TODO(joyeecheung): refactor the MemoryTracker interface so
   // this can be done for common types within the Track* calls automatically
   // if a certain scope is entered.
-  size -= sizeof(thread_stopper_);
   size -= sizeof(async_hooks_);
   size -= sizeof(tick_info_);
   size -= sizeof(immediate_info_);
@@ -985,19 +2007,16 @@ void Environment::MemoryInfo(MemoryTracker* tracker) const {
   // Iteratable STLs have their own sizes subtracted from the parent
   // by default.
   tracker->TrackField("isolate_data", isolate_data_);
-  tracker->TrackField("native_modules_with_cache", native_modules_with_cache);
-  tracker->TrackField("native_modules_without_cache",
-                      native_modules_without_cache);
+  tracker->TrackField("builtins_with_cache", builtins_with_cache);
+  tracker->TrackField("builtins_without_cache", builtins_without_cache);
   tracker->TrackField("destroy_async_id_list", destroy_async_id_list_);
   tracker->TrackField("exec_argv", exec_argv_);
+  tracker->TrackField("exiting", exiting_);
   tracker->TrackField("should_abort_on_uncaught_toggle",
                       should_abort_on_uncaught_toggle_);
   tracker->TrackField("stream_base_state", stream_base_state_);
-  tracker->TrackField("fs_stats_field_array", fs_stats_field_array_);
-  tracker->TrackField("fs_stats_field_bigint_array",
-                      fs_stats_field_bigint_array_);
-  tracker->TrackField("thread_stopper", thread_stopper_);
-  tracker->TrackField("cleanup_hooks", cleanup_hooks_);
+  tracker->TrackFieldWithSize(
+      "cleanup_hooks", cleanup_hooks_.size() * sizeof(CleanupHookCallback));
   tracker->TrackField("async_hooks", async_hooks_);
   tracker->TrackField("immediate_info", immediate_info_);
   tracker->TrackField("tick_info", tick_info_);
@@ -1018,90 +2037,129 @@ void Environment::MemoryInfo(MemoryTracker* tracker) const {
   // node, we shift its sizeof() size out of the Environment node.
 }
 
-char* Environment::Reallocate(char* data, size_t old_size, size_t size) {
-  if (old_size == size) return data;
-  // If we know that the allocator is our ArrayBufferAllocator, we can let
-  // if reallocate directly.
-  if (isolate_data()->uses_node_allocator()) {
-    return static_cast<char*>(
-        isolate_data()->node_allocator()->Reallocate(data, old_size, size));
-  }
-  // Generic allocators do not provide a reallocation method; we need to
-  // allocate a new chunk of memory and copy the data over.
-  char* new_data = AllocateUnchecked(size);
-  if (new_data == nullptr) return nullptr;
-  memcpy(new_data, data, std::min(size, old_size));
-  if (size > old_size)
-    memset(new_data + old_size, 0, size - old_size);
-  Free(data, old_size);
-  return new_data;
-}
-
-void Environment::AddArrayBufferAllocatorToKeepAliveUntilIsolateDispose(
-    std::shared_ptr<v8::ArrayBuffer::Allocator> allocator) {
-  if (keep_alive_allocators_ == nullptr) {
-    MultiIsolatePlatform* platform = isolate_data()->platform();
-    CHECK_NOT_NULL(platform);
-
-    keep_alive_allocators_ = new ArrayBufferAllocatorList();
-    platform->AddIsolateFinishedCallback(isolate(), [](void* data) {
-      delete static_cast<ArrayBufferAllocatorList*>(data);
-    }, static_cast<void*>(keep_alive_allocators_));
-  }
-
-  keep_alive_allocators_->insert(allocator);
-}
-
-bool Environment::RunWeakRefCleanup() {
+void Environment::RunWeakRefCleanup() {
   isolate()->ClearKeptObjects();
-
-  while (!cleanup_finalization_groups_.empty()) {
-    Local<FinalizationGroup> fg =
-        cleanup_finalization_groups_.front().Get(isolate());
-    cleanup_finalization_groups_.pop_front();
-    if (!FinalizationGroup::Cleanup(fg).FromMaybe(false)) {
-      return false;
-    }
-  }
-
-  return true;
-}
-
-void AsyncRequest::Install(Environment* env, void* data, uv_async_cb target) {
-  CHECK_NULL(async_);
-  env_ = env;
-  async_ = new uv_async_t;
-  async_->data = data;
-  CHECK_EQ(uv_async_init(env_->event_loop(), async_, target), 0);
-}
-
-void AsyncRequest::Uninstall() {
-  if (async_ != nullptr) {
-    env_->CloseHandle(async_, [](uv_async_t* async) { delete async; });
-    async_ = nullptr;
-  }
-}
-
-void AsyncRequest::Stop() {
-  set_stopped(true);
-  if (async_ != nullptr) uv_async_send(async_);
-}
-
-uv_async_t* AsyncRequest::GetHandle() {
-  return async_;
-}
-
-void AsyncRequest::MemoryInfo(MemoryTracker* tracker) const {
-  if (async_ != nullptr) tracker->TrackField("async_request", *async_);
-}
-
-AsyncRequest::~AsyncRequest() {
-  CHECK_NULL(async_);
 }
 
 // Not really any better place than env.cc at this moment.
+BaseObject::BaseObject(Environment* env, Local<Object> object)
+    : persistent_handle_(env->isolate(), object), env_(env) {
+  CHECK_EQ(false, object.IsEmpty());
+  CHECK_GE(object->InternalFieldCount(), BaseObject::kInternalFieldCount);
+  object->SetAlignedPointerInInternalField(BaseObject::kEmbedderType,
+                                           &kNodeEmbedderId);
+  object->SetAlignedPointerInInternalField(BaseObject::kSlot,
+                                           static_cast<void*>(this));
+  env->AddCleanupHook(DeleteMe, static_cast<void*>(this));
+  env->modify_base_object_count(1);
+}
+
+BaseObject::~BaseObject() {
+  env()->modify_base_object_count(-1);
+  env()->RemoveCleanupHook(DeleteMe, static_cast<void*>(this));
+
+  if (UNLIKELY(has_pointer_data())) {
+    PointerData* metadata = pointer_data();
+    CHECK_EQ(metadata->strong_ptr_count, 0);
+    metadata->self = nullptr;
+    if (metadata->weak_ptr_count == 0) delete metadata;
+  }
+
+  if (persistent_handle_.IsEmpty()) {
+    // This most likely happened because the weak callback below cleared it.
+    return;
+  }
+
+  {
+    HandleScope handle_scope(env()->isolate());
+    object()->SetAlignedPointerInInternalField(BaseObject::kSlot, nullptr);
+  }
+}
+
+void BaseObject::MakeWeak() {
+  if (has_pointer_data()) {
+    pointer_data()->wants_weak_jsobj = true;
+    if (pointer_data()->strong_ptr_count > 0) return;
+  }
+
+  persistent_handle_.SetWeak(
+      this,
+      [](const WeakCallbackInfo<BaseObject>& data) {
+        BaseObject* obj = data.GetParameter();
+        // Clear the persistent handle so that ~BaseObject() doesn't attempt
+        // to mess with internal fields, since the JS object may have
+        // transitioned into an invalid state.
+        // Refs: https://github.com/nodejs/node/issues/18897
+        obj->persistent_handle_.Reset();
+        CHECK_IMPLIES(obj->has_pointer_data(),
+                      obj->pointer_data()->strong_ptr_count == 0);
+        obj->OnGCCollect();
+      },
+      WeakCallbackType::kParameter);
+}
+
+// This just has to be different from the Chromium ones:
+// https://source.chromium.org/chromium/chromium/src/+/main:gin/public/gin_embedders.h;l=18-23;drc=5a758a97032f0b656c3c36a3497560762495501a
+// Otherwise, when Node is loaded in an isolate which uses cppgc, cppgc will
+// misinterpret the data stored in the embedder fields and try to garbage
+// collect them.
+uint16_t kNodeEmbedderId = 0x90de;
+
+void BaseObject::LazilyInitializedJSTemplateConstructor(
+    const FunctionCallbackInfo<Value>& args) {
+  DCHECK(args.IsConstructCall());
+  CHECK_GE(args.This()->InternalFieldCount(), BaseObject::kInternalFieldCount);
+  args.This()->SetAlignedPointerInInternalField(BaseObject::kEmbedderType,
+                                                &kNodeEmbedderId);
+  args.This()->SetAlignedPointerInInternalField(BaseObject::kSlot, nullptr);
+}
+
+Local<FunctionTemplate> BaseObject::MakeLazilyInitializedJSTemplate(
+    Environment* env) {
+  Local<FunctionTemplate> t = NewFunctionTemplate(
+      env->isolate(), LazilyInitializedJSTemplateConstructor);
+  t->Inherit(BaseObject::GetConstructorTemplate(env));
+  t->InstanceTemplate()->SetInternalFieldCount(BaseObject::kInternalFieldCount);
+  return t;
+}
+
+BaseObject::PointerData* BaseObject::pointer_data() {
+  if (!has_pointer_data()) {
+    PointerData* metadata = new PointerData();
+    metadata->wants_weak_jsobj = persistent_handle_.IsWeak();
+    metadata->self = this;
+    pointer_data_ = metadata;
+  }
+  CHECK(has_pointer_data());
+  return pointer_data_;
+}
+
+void BaseObject::decrease_refcount() {
+  CHECK(has_pointer_data());
+  PointerData* metadata = pointer_data();
+  CHECK_GT(metadata->strong_ptr_count, 0);
+  unsigned int new_refcount = --metadata->strong_ptr_count;
+  if (new_refcount == 0) {
+    if (metadata->is_detached) {
+      OnGCCollect();
+    } else if (metadata->wants_weak_jsobj && !persistent_handle_.IsEmpty()) {
+      MakeWeak();
+    }
+  }
+}
+
+void BaseObject::increase_refcount() {
+  unsigned int prev_refcount = pointer_data()->strong_ptr_count++;
+  if (prev_refcount == 0 && !persistent_handle_.IsEmpty())
+    persistent_handle_.ClearWeak();
+}
+
 void BaseObject::DeleteMe(void* data) {
   BaseObject* self = static_cast<BaseObject*>(data);
+  if (self->has_pointer_data() &&
+      self->pointer_data()->strong_ptr_count > 0) {
+    return self->Detach();
+  }
   delete self;
 }
 
@@ -1109,6 +2167,24 @@ bool BaseObject::IsDoneInitializing() const { return true; }
 
 Local<Object> BaseObject::WrappedObject() const {
   return object();
+}
+
+bool BaseObject::IsRootNode() const {
+  return !persistent_handle_.IsWeak();
+}
+
+Local<FunctionTemplate> BaseObject::GetConstructorTemplate(Environment* env) {
+  Local<FunctionTemplate> tmpl = env->base_object_ctor_template();
+  if (tmpl.IsEmpty()) {
+    tmpl = NewFunctionTemplate(env->isolate(), nullptr);
+    tmpl->SetClassName(FIXED_ONE_BYTE_STRING(env->isolate(), "BaseObject"));
+    env->set_base_object_ctor_template(tmpl);
+  }
+  return tmpl;
+}
+
+bool BaseObject::IsNotIndicativeOfMemoryLeakAtExit() const {
+  return IsWeakOrDetached();
 }
 
 }  // namespace node
